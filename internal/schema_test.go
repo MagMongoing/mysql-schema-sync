@@ -8,8 +8,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/elliotchance/orderedmap"
-	"github.com/stretchr/testify/require"
+	"github.com/xanygo/anygo/ds/xmap"
+	"github.com/xanygo/anygo/xt"
 )
 
 func testLoadFile(name string) string {
@@ -32,11 +32,11 @@ func TestParseSchema(t *testing.T) {
 		{
 			name: "case 1",
 			args: args{
-				schema: testLoadFile("testdata/user_0.sql"),
+				schema: testLoadFile("testdata/user/user_0.sql"),
 			},
 			want: &MySchema{
-				Fields: (func() *orderedmap.OrderedMap {
-					m := orderedmap.NewOrderedMap()
+				Fields: (func() xmap.Ordered[string, string] {
+					m := xmap.Ordered[string, string]{}
 					// 不会检查 value
 					m.Set("id", "`id` bigint unsigned NOT NULL AUTO_INCREMENT,")
 					m.Set("email", "`email` varchar(1000) NOT NULL DEFAULT '',")
@@ -57,11 +57,11 @@ func TestParseSchema(t *testing.T) {
 		{
 			name: "case 2",
 			args: args{
-				schema: testLoadFile("testdata/user_4.sql"),
+				schema: testLoadFile("testdata/user/user_4.sql"),
 			},
 			want: &MySchema{
-				Fields: (func() *orderedmap.OrderedMap {
-					m := orderedmap.NewOrderedMap()
+				Fields: (func() xmap.Ordered[string, string] {
+					m := xmap.Ordered[string, string]{}
 					// 不会检查 value
 					m.Set("id", "\"id\" bigint unsigned NOT NULL AUTO_INCREMENT,")
 					m.Set("email", "\"email\" varchar(1000) NOT NULL DEFAULT \"\",")
@@ -85,7 +85,7 @@ func TestParseSchema(t *testing.T) {
 			got := ParseSchema(tt.args.schema)
 			gs := got.String()
 			ws := tt.want.String()
-			require.Equal(t, ws, gs)
+			xt.Equal(t, ws, gs)
 		})
 	}
 }

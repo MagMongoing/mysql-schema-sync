@@ -1,0 +1,73 @@
+# This workflow will build a golang project
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-go
+
+name: Go
+
+on:
+  push:
+  pull_request:
+
+jobs:
+
+  test:
+    strategy:
+      matrix:
+        go: [ '1.25' ]
+        mysql_version: [ '5.7', '8.0' ]
+        servers: [ "ubuntu-latest" ]
+    runs-on: ${{ matrix.servers }}
+
+    services:
+      mysql:
+        image: mysql:${{ matrix.mysql_version }}
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: testdb
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost -uroot -proot"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=3
+
+    env:
+      MSS_Test_Source: "root:root@(127.0.0.1:3306)/mss_test_db0"
+      MSS_Test_Dest : "root:root@(127.0.0.1:3306)/mss_test_db1"
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ matrix.go }}
+        check-latest: true
+
+    - name: Display Go version
+      run: go version
+
+    - name: Wait for MySQL to be ready
+      run: |
+          until mysql -h 127.0.0.1 -uroot -proot -e 'select 1' &> /dev/null; do
+            echo "Waiting for MySQL..."
+            sleep 3
+          done
+
+    - name: show DATABASES
+      run: |
+          mysql -h 127.0.0.1 -uroot -proot -e "SHOW DATABASES;"
+
+    - name: Test
+      run: go test -v ./...
+
+    - name: Build
+      run: go build -v ./...
+
+    - name: Vet
+      run: go vet ./...
+
+    - name: gorgeous style check
+      if: matrix.mysql_version == '5.7'
+      run: go install github.com/fsgo/go_fmt/cmd/gorgeous@latest && gorgeous -d ./...
+

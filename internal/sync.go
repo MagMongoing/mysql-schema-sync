@@ -3,7 +3,10 @@ package internal
 import (
 	"fmt"
 	"log"
+	"slices"
 	"strings"
+
+	"github.com/xanygo/anygo/cli/xcolor"
 )
 
 // SchemaSync 配置文件
@@ -17,8 +20,8 @@ type SchemaSync struct {
 func NewSchemaSync(config *Config) *SchemaSync {
 	s := new(SchemaSync)
 	s.Config = config
-	s.SourceDb = NewMyDb(config.SourceDSN, "source")
-	s.DestDb = NewMyDb(config.DestDSN, "dest")
+	s.SourceDb = NewMyDb(config.SourceDSN, dbTypeSource)
+	s.DestDb = NewMyDb(config.DestDSN, dbTypeDest)
 	return s
 }
 
@@ -37,12 +40,11 @@ func (sc *SchemaSync) GetNewTableNames() []string {
 	return newTables
 }
 
-// 合并源数据库和目标数据库的表名
-func (sc *SchemaSync) GetTableNames() []string {
+// AllDBTables 合并源数据库和目标数据库的表名
+func (sc *SchemaSync) AllDBTables() []string {
 	sourceTables := sc.SourceDb.GetTableNames()
 	destTables := sc.DestDb.GetTableNames()
-	var tables []string
-	tables = append(tables, destTables...)
+	tables := slices.Clone(destTables)
 	for _, name := range sourceTables {
 		if !inStringSlice(name, tables) {
 			tables = append(tables, name)
@@ -67,7 +69,32 @@ func (sc *SchemaSync) getAlterDataBySchema(table string, sSchema string, dSchema
 	alter := new(TableAlterData)
 	alter.Table = table
 	alter.Type = alterTypeNo
-	alter.SchemaDiff = newSchemaDiff(table, RemoveTableSchemaConfig(sSchema), RemoveTableSchemaConfig(dSchema))
+
+	// Try to get structured field information from INFORMATION_SCHEMA.COLUMNS
+	// Only if we have database connections (not in unit tests)
+	var sourceFields, destFields map[string]*FieldInfo
+	var sourceFieldsErr, destFieldsErr error
+
+	if sc.SourceDb != nil && sc.DestDb != nil {
+		sourceFields, sourceFieldsErr = sc.SourceDb.TableFieldsFromInformationSchema(table)
+		destFields, destFieldsErr = sc.DestDb.TableFieldsFromInformationSchema(table)
+	}
+
+	// If we can get structured field information from both databases, use it for precise comparison
+	if sourceFieldsErr == nil && destFieldsErr == nil && sourceFields != nil && destFields != nil {
+		log.Printf("[Debug] Using structured field comparison for table %q", table)
+		alter.SchemaDiff = NewSchemaDiffWithFieldInfos(table, RemoveTableSchemaConfig(sSchema), RemoveTableSchemaConfig(dSchema), sourceFields, destFields)
+	} else {
+		// Fallback to legacy text-based comparison
+		if sourceFieldsErr != nil {
+			log.Printf("[Debug] Failed to get source fields for table %q: %s", table, errString(sourceFieldsErr))
+		}
+		if destFieldsErr != nil {
+			log.Printf("[Debug] Failed to get dest fields for table %q: %s", table, errString(destFieldsErr))
+		}
+		log.Printf("[Debug] Using legacy text-based comparison for table %q", table)
+		alter.SchemaDiff = newSchemaDiff(table, RemoveTableSchemaConfig(sSchema), RemoveTableSchemaConfig(dSchema))
+	}
 
 	if sSchema == dSchema {
 		return alter
@@ -110,44 +137,157 @@ func (sc *SchemaSync) getSchemaDiff(alter *TableAlterData) []string {
 	var beforeFieldName string
 	var alterLines []string
 	var fieldCount int = 0
-	// 比对字段
-	for el := sourceMyS.Fields.Front(); el != nil; el = el.Next() {
-		if sc.Config.IsIgnoreField(table, el.Key.(string)) {
-			log.Printf("ignore column %s.%s", table, el.Key.(string))
-			continue
-		}
-		var alterSQL string
-		if destDt, has := destMyS.Fields.Get(el.Key); has {
-			if el.Value != destDt {
-				alterSQL = fmt.Sprintf("CHANGE `%s` %s", el.Key, el.Value)
-			}
-			beforeFieldName = el.Key.(string)
-		} else {
-			if len(beforeFieldName) == 0 {
-				if fieldCount == 0 {
-					alterSQL = "ADD " + el.Value.(string) + " FIRST"
-				} else {
-					alterSQL = "ADD " + el.Value.(string)
-				}
-			} else {
-        alterSQL = fmt.Sprintf("ADD %s AFTER `%s`", el.Value.(string), beforeFieldName)
-			}
-			beforeFieldName = el.Key.(string)
-		}
+	var sourceFieldPosition int = 0 // Track position in source table
 
-		if len(alterSQL) != 0 {
-			log.Println("[Debug] check column.alter ", fmt.Sprintf("%s.%s", table, el.Key.(string)), "alterSQL=", alterSQL)
-			alterLines = append(alterLines, alterSQL)
-		} else {
-			log.Println("[Debug] check column.alter ", fmt.Sprintf("%s.%s", table, el.Key.(string)), "not change")
+	// 比对字段 - Two-phase comparison strategy:
+	// Phase 1: Compare text from SHOW CREATE TABLE first
+	// Phase 2: Only if text differs, use INFORMATION_SCHEMA for detailed comparison
+	useStructuredComparison := len(sourceMyS.FieldInfos) > 0 && len(destMyS.FieldInfos) > 0
+
+	if useStructuredComparison {
+		log.Printf("[Debug] Using two-phase field comparison for table %s", table)
+		// Use two-phase comparison
+		for fieldName, value := range sourceMyS.Fields.Iter() {
+			sourceFieldPosition++ // Increment position for each field in source
+
+			if sc.Config.IsIgnoreField(table, fieldName) {
+				log.Printf("ignore column %s.%s", table, fieldName)
+				continue
+			}
+			var alterSQL string
+
+			if destValue, has := destMyS.Fields.Get(fieldName); has {
+				// Field exists in destination
+				sourceFieldInfo := sourceMyS.FieldInfos[fieldName]
+				destFieldInfo := destMyS.FieldInfos[fieldName]
+
+				// Phase 1: Compare text from SHOW CREATE TABLE directly
+				if value == destValue {
+					// Text definitions are identical
+					// Check field order if FieldOrder flag is enabled
+					if sc.Config.FieldOrder && sourceFieldInfo != nil && destFieldInfo != nil {
+						if sourceFieldInfo.OrdinalPosition != destFieldInfo.OrdinalPosition {
+							// Field order differs, generate MODIFY statement
+							alterSQL = fmt.Sprintf("MODIFY COLUMN %s", sourceFieldInfo.String())
+							if len(beforeFieldName) > 0 {
+								alterSQL += fmt.Sprintf(" AFTER `%s`", beforeFieldName)
+							} else {
+								alterSQL += " FIRST"
+							}
+							log.Printf("[Debug] field %s.%s: order differs (source pos=%d, dest pos=%d), generating MODIFY",
+								table, fieldName, sourceFieldInfo.OrdinalPosition, destFieldInfo.OrdinalPosition)
+						} else {
+							log.Println("[Debug] check column.alter ", fmt.Sprintf("%s.%s", table, fieldName), "not change (text identical)")
+						}
+					} else {
+						log.Println("[Debug] check column.alter ", fmt.Sprintf("%s.%s", table, fieldName), "not change (text identical)")
+					}
+					// Only update position tracking if no alterSQL generated (field is truly unchanged)
+					if len(alterSQL) == 0 {
+						beforeFieldName = fieldName
+						fieldCount++
+						continue
+					}
+				} else {
+					// Phase 2: Text differs, use structured comparison to determine if change is needed
+					if sourceFieldInfo != nil && destFieldInfo != nil {
+						if sourceFieldInfo.Equals(destFieldInfo) {
+							// Structured info shows they're semantically equal despite text difference
+							// Still check field order if FieldOrder flag is enabled
+							if sc.Config.FieldOrder && sourceFieldInfo.OrdinalPosition != destFieldInfo.OrdinalPosition {
+								alterSQL = fmt.Sprintf("MODIFY COLUMN %s", sourceFieldInfo.String())
+								if len(beforeFieldName) > 0 {
+									alterSQL += fmt.Sprintf(" AFTER `%s`", beforeFieldName)
+								} else {
+									alterSQL += " FIRST"
+								}
+								log.Printf("[Debug] field %s.%s: semantically equal but order differs, generating MODIFY", table, fieldName)
+							} else {
+								log.Printf("[Debug] field %s.%s: text differs but semantically equal, skipping", table, fieldName)
+								log.Printf("[Debug] source text: %s", value)
+								log.Printf("[Debug] dest text: %s", destValue)
+								beforeFieldName = fieldName
+								fieldCount++
+								continue
+							}
+						} else {
+							// Fields are genuinely different
+							alterSQL = fmt.Sprintf("CHANGE `%s` %s", fieldName, sourceFieldInfo.String())
+							log.Printf("[Debug] field %s.%s: confirmed difference via structured comparison", table, fieldName)
+							log.Printf("[Debug] source: %+v", sourceFieldInfo)
+							log.Printf("[Debug] dest: %+v", destFieldInfo)
+						}
+					} else {
+						// No structured info, use text-based CHANGE
+						alterSQL = fmt.Sprintf("CHANGE `%s` %s", fieldName, value)
+						log.Printf("[Debug] field %s.%s: text differs, using text-based change", table, fieldName)
+					}
+				}
+				// Always update position tracking to reflect source table order
+				beforeFieldName = fieldName
+			} else {
+				// Field doesn't exist in destination, ADD it
+				if len(beforeFieldName) == 0 {
+					if fieldCount == 0 {
+						alterSQL = "ADD " + value + " FIRST"
+					} else {
+						alterSQL = "ADD " + value
+					}
+				} else {
+					alterSQL = fmt.Sprintf("ADD %s AFTER `%s`", value, beforeFieldName)
+				}
+				beforeFieldName = fieldName
+			}
+
+			if len(alterSQL) != 0 {
+				log.Println("[Debug] check column.alter ", fmt.Sprintf("%s.%s", table, fieldName), "alterSQL=", alterSQL)
+				alterLines = append(alterLines, alterSQL)
+			} else {
+				log.Println("[Debug] check column.alter ", fmt.Sprintf("%s.%s", table, fieldName), "not change")
+			}
+			fieldCount++
 		}
-		fieldCount++
+	} else {
+		log.Printf("[Debug] Using legacy text-based field comparison for table %s", table)
+		// Use legacy text-based comparison
+		for fieldName, value := range sourceMyS.Fields.Iter() {
+			if sc.Config.IsIgnoreField(table, fieldName) {
+				log.Printf("ignore column %s.%s", table, fieldName)
+				continue
+			}
+			var alterSQL string
+			if destDt, has := destMyS.Fields.Get(fieldName); has {
+				if value != destDt {
+					alterSQL = fmt.Sprintf("CHANGE `%s` %s", fieldName, value)
+				}
+				beforeFieldName = fieldName
+			} else {
+				if len(beforeFieldName) == 0 {
+					if fieldCount == 0 {
+						alterSQL = "ADD " + value + " FIRST"
+					} else {
+						alterSQL = "ADD " + value
+					}
+				} else {
+					alterSQL = fmt.Sprintf("ADD %s AFTER `%s`", value, beforeFieldName)
+				}
+				beforeFieldName = fieldName
+			}
+
+			if len(alterSQL) != 0 {
+				log.Println("[Debug] check column.alter ", fmt.Sprintf("%s.%s", table, fieldName), "alterSQL=", alterSQL)
+				alterLines = append(alterLines, alterSQL)
+			} else {
+				log.Println("[Debug] check column.alter ", fmt.Sprintf("%s.%s", table, fieldName), "not change")
+			}
+			fieldCount++
+		}
 	}
 
 	// 源库已经删除的字段
 	if sc.Config.Drop {
 		for _, name := range destMyS.Fields.Keys() {
-			if sc.Config.IsIgnoreField(table, name.(string)) {
+			if sc.Config.IsIgnoreField(table, name) {
 				log.Printf("ignore column %s.%s", table, name)
 				continue
 			}
@@ -260,8 +400,9 @@ func (sc *SchemaSync) getSchemaDiff(alter *TableAlterData) []string {
 
 // SyncSQL4Dest sync schema change
 func (sc *SchemaSync) SyncSQL4Dest(sqlStr string, sqls []string) error {
-	log.Print("Exec_SQL_START:\n>>>>>>\n", sqlStr, "\n<<<<<<<<\n\n")
 	sqlStr = strings.TrimSpace(sqlStr)
+	xcolor.Green(sqlStr)
+	log.Print("Exec_SQL:\n>>>>>>\n", xcolor.GreenString(sqlStr), "\n<<<<<<<<\n\n")
 	if len(sqlStr) == 0 {
 		log.Println("sql_is_empty, skip")
 		return nil
@@ -273,7 +414,7 @@ func (sc *SchemaSync) SyncSQL4Dest(sqlStr string, sqls []string) error {
 		if ret != nil {
 			err := ret.Close()
 			if err != nil {
-				log.Println("close ret error:", err)
+				log.Println("close ret error:", errString(err))
 				return
 			}
 		}
@@ -281,138 +422,32 @@ func (sc *SchemaSync) SyncSQL4Dest(sqlStr string, sqls []string) error {
 
 	// how to enable allowMultiQueries?
 	if err != nil && len(sqls) > 1 {
-		log.Println("exec_mut_query failed, err=", err, ",now exec SQLs foreach")
-		tx, errTx := sc.DestDb.Db.Begin()
-		if errTx == nil {
-			for _, sql := range sqls {
-				ret, err = tx.Query(sql)
-				log.Println("query_one:[", sql, "]", err)
-				if err != nil {
-					break
-				}
+		log.Println("Exec_mut_query failed, err=", errString(err), ", now try exec SQLs foreach")
+		tx, errTx := sc.DestDb.sqlDB.Begin()
+		if errTx != nil {
+			log.Println("db.Begin failed", errString(err))
+			return errTx
+		}
+		for _, sql := range sqls {
+			ret, err = tx.Query(sql)
+			log.Println("query_one:[", sql, "]", errString(err))
+			if err != nil {
+				break
 			}
-			if err == nil {
-				err = tx.Commit()
-			} else {
-				_ = tx.Rollback()
-			}
+		}
+		if err == nil {
+			err = tx.Commit()
+		} else {
+			_ = tx.Rollback()
 		}
 	}
 	t.stop()
 	if err != nil {
-		log.Println("EXEC_SQL_FAILED:", err)
+		log.Println("EXEC_SQL_FAILED:", errString(err))
 		return err
 	}
 	log.Println("EXEC_SQL_SUCCESS, used:", t.usedSecond())
 	cl, err := ret.Columns()
 	log.Println("EXEC_SQL_RET:", cl, err)
 	return err
-}
-
-// CheckSchemaDiff 执行最终的 diff
-func CheckSchemaDiff(cfg *Config) {
-	scs := newStatics(cfg)
-	defer func() {
-		scs.timer.stop()
-		scs.sendMailNotice(cfg)
-	}()
-
-	sc := NewSchemaSync(cfg)
-	newTables := sc.GetTableNames()
-	// log.Println("source db table total:", len(newTables))
-
-	changedTables := make(map[string][]*TableAlterData)
-
-	for _, table := range newTables {
-		// log.Printf("Index : %d Table : %s\n", index, table)
-		if !cfg.CheckMatchTables(table) {
-			// log.Println("Table:", table, "skip")
-			continue
-		}
-
-		if cfg.CheckMatchIgnoreTables(table) {
-			log.Println("Table:", table, "skipped by ignore")
-			continue
-		}
-
-		sd := sc.getAlterDataByTable(table, cfg)
-
-		if sd.Type == alterTypeNo {
-			log.Println("table:", table, "not change,", sd)
-			continue
-		}
-
-		if sd.Type == alterTypeDropTable {
-			log.Println("skipped table", table, ",only exists in dest's db")
-			continue
-		}
-
-		fmt.Println(sd)
-		fmt.Println("")
-		relationTables := sd.SchemaDiff.RelationTables()
-		// fmt.Println("relationTables:",table,relationTables)
-
-		// 将所有有外键关联的单独放
-		groupKey := "multi"
-		if len(relationTables) == 0 {
-			groupKey = "single_" + table
-		}
-		if _, has := changedTables[groupKey]; !has {
-			changedTables[groupKey] = make([]*TableAlterData, 0)
-		}
-		changedTables[groupKey] = append(changedTables[groupKey], sd)
-	}
-
-	log.Println("[Debug] changedTables:", changedTables)
-
-	var countSuccess int
-	var countFailed int
-	canRunTypePref := "single"
-
-	// 先执行单个表的
-runSync:
-	for typeName, sds := range changedTables {
-		if !strings.HasPrefix(typeName, canRunTypePref) {
-			continue
-		}
-		log.Println("runSyncType:", typeName)
-		var sqls []string
-		var sts []*tableStatics
-		for _, sd := range sds {
-			for index := range sd.SQL {
-				sql := strings.TrimRight(sd.SQL[index], ";")
-				sqls = append(sqls, sql)
-
-				st := scs.newTableStatics(sd.Table, sd, index)
-				sts = append(sts, st)
-			}
-		}
-
-		sql := strings.Join(sqls, ";\n") + ";"
-		var ret error
-
-		if sc.Config.Sync {
-			ret = sc.SyncSQL4Dest(sql, sqls)
-			if ret == nil {
-				countSuccess++
-			} else {
-				countFailed++
-			}
-		}
-		for _, st := range sts {
-			st.alterRet = ret
-			st.schemaAfter = sc.DestDb.GetTableSchema(st.table)
-			st.timer.stop()
-		}
-	} // end for
-
-	// 最后再执行多个表的 alter
-	if canRunTypePref == "single" {
-		canRunTypePref = "multi"
-		goto runSync
-	}
-
-	if sc.Config.Sync {
-		log.Println("execute_all_sql_done, success_total:", countSuccess, "failed_total:", countFailed)
-	}
 }

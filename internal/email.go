@@ -1,13 +1,14 @@
 package internal
 
 import (
-	"encoding/base64"
-	"fmt"
+	"context"
 	"log"
+	"net"
 	"strconv"
 	"strings"
+	"time"
 
-	"gopkg.in/gomail.v2"
+	"github.com/xanygo/anygo/xnet/xsmtp"
 )
 
 // EmailStruct email conf info
@@ -47,9 +48,9 @@ func (m *EmailStruct) SendMail(title string, body string) {
 		log.Println("smtp_host, from,to is empty")
 		return
 	}
-	addrInfo := strings.Split(m.SMTPHost, ":")
-	if len(addrInfo) != 2 {
-		log.Println("smtp_host wrong, eg: host_name:25")
+	host, port, err := net.SplitHostPort(m.SMTPHost)
+	if err != nil {
+		log.Println("invalid SMTPHost:", m.SMTPHost)
 		return
 	}
 	var sendTo []string
@@ -66,26 +67,24 @@ func (m *EmailStruct) SendMail(title string, body string) {
 	}
 
 	body = mailBody(body)
+	portInt, _ := strconv.Atoi(port)
 
-	msgBody := fmt.Sprintf(
-		"To: %s\r\n"+
-			"Content-Type: text/html;charset=utf-8\r\n"+
-			"Subject: =?UTF-8?B? %s ?=\r\n"+
-			"\r\n%s",
-		strings.Join(sendTo, ";"),
-		base64.StdEncoding.EncodeToString([]byte(title)),
-		body,
-	)
-	a := gomail.NewMessage()
-	a.SetHeader("From", m.From)
-	a.SetHeader("To", sendTo...)      // 发送给多个用户
-	a.SetHeader("Subject", "表结构对比通知") // 设置邮件主题
-	a.SetBody("text/html", msgBody)   // 设置邮件正文
-	port, _ := strconv.Atoi(addrInfo[1])
+	cfg := &xsmtp.Config{
+		Host:     host,
+		Port:     portInt,
+		Username: m.From,
+		Password: m.Password,
+	}
+	mail := &xsmtp.Mail{
+		To:      sendTo,
+		Subject: title,
+		Content: body,
+	}
 
-	d := gomail.NewDialer(addrInfo[0], port, m.From, m.Password)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
 
-	err := d.DialAndSend(a)
+	err = cfg.Send(ctx, mail)
 	if err == nil {
 		log.Println("send mail success")
 	} else {
