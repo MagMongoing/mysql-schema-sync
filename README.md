@@ -100,6 +100,29 @@ cp config.json mydb_conf.json
 
 ```
 
+### 启动 HTTP 报告服务
+
+```shell
+# 监听本地 8080 端口（默认仅允许 127.0.0.1 访问）
+./mysql-schema-sync -conf mydb_conf.json -http :8080
+
+# 指定监听地址
+./mysql-schema-sync -conf mydb_conf.json -http 127.0.0.1:9090
+
+# 监听所有网卡（需要显式允许非回环地址，无鉴权，注意安全风险）
+./mysql-schema-sync -conf mydb_conf.json -http 0.0.0.0:58888 -http-allow-public
+```
+
+启动后访问对应地址即可查看 schema diff 报告页面。程序持续运行，按 `Ctrl-C` 终止。
+
+### 指定 HTML 报告输出路径
+
+```shell
+./mysql-schema-sync -conf mydb_conf.json -html ./schema-diff-report.html
+```
+
+不指定 `-html` 时，报告默认写入 `$TMPDIR/mysql-schema-sync_last.html`。
+
 ### 使用shell调度
 
 ```shell
@@ -150,6 +173,8 @@ mysql-schema-sync -help
         覆盖配置文件中的 email.to；显式传入空值可清空收件人
   -single_schema_change
         每条 ALTER TABLE 尽量只包含一个修改操作
+  -skip_timestamp_to_datetime
+        源库 timestamp → 目标库 datetime 时跳过类型变更，保留目标库类型
   -source string
         源数据库 DSN；非空时不读取 -conf，必须同时提供 -dest
   -sync
