@@ -145,3 +145,35 @@ func TestParseSchema_NonNil(t *testing.T) {
 		t.Fatal("ParseSchema returned nil for valid input")
 	}
 }
+
+func TestParseDbIndexLineLowercaseKeywords(t *testing.T) {
+	fk := parseDbIndexLine("constraint `fk_parent` foreign key (`parent_id`) references `parent` (`id`)")
+	if fk == nil || fk.IndexType != indexTypeForeignKey || fk.Name != "fk_parent" {
+		t.Fatalf("lowercase foreign key was not parsed: %#v", fk)
+	}
+	if len(fk.RelationTables) != 1 || fk.RelationTables[0] != "parent" {
+		t.Fatalf("lowercase REFERENCES table was not parsed: %#v", fk.RelationTables)
+	}
+	if len(fk.ReferencedColumns) != 1 || fk.ReferencedColumns[0] != "id" {
+		t.Fatalf("referenced columns were not parsed: %#v", fk.ReferencedColumns)
+	}
+
+	check := parseDbIndexLine("constraint `chk_positive` check ((`value` > 0))")
+	if check == nil || check.IndexType != indexTypeCheck || check.Name != "chk_positive" {
+		t.Fatalf("lowercase check constraint was not parsed: %#v", check)
+	}
+}
+
+func TestParseDbIndexLineCompositeReferencedColumns(t *testing.T) {
+	fk := parseDbIndexLine(
+		"CONSTRAINT `fk_composite` FOREIGN KEY (`tenant_id`,`parent_id`) REFERENCES `parent` (`tenant_id`,`id`)",
+	)
+	if fk == nil {
+		t.Fatal("composite foreign key was not parsed")
+	}
+	if len(fk.ReferencedColumns) != 2 ||
+		fk.ReferencedColumns[0] != "tenant_id" ||
+		fk.ReferencedColumns[1] != "id" {
+		t.Fatalf("composite referenced columns were not parsed: %#v", fk.ReferencedColumns)
+	}
+}

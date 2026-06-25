@@ -443,6 +443,19 @@ func TestConfig_IgnoreAndMatch(t *testing.T) {
 	})
 }
 
+func TestConfigNilAlterIgnoreEntryDoesNotPanic(t *testing.T) {
+	cfg := &Config{AlterIgnore: map[string]*AlterIgnoreTable{"users": nil}}
+	if cfg.IsIgnoreField("users", "password") {
+		t.Fatal("nil ignore entry unexpectedly ignored field")
+	}
+	if cfg.IsIgnoreIndex("users", "idx_name") {
+		t.Fatal("nil ignore entry unexpectedly ignored index")
+	}
+	if cfg.IsIgnoreForeignKey("users", "fk_order") {
+		t.Fatal("nil ignore entry unexpectedly ignored foreign key")
+	}
+}
+
 // TestConfig_String_MasksCredentials verifies Config.String() masks
 // DSN passwords and email password. M3.
 func TestConfig_String_MasksCredentials(t *testing.T) {

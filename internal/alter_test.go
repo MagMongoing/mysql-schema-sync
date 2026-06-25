@@ -97,6 +97,28 @@ func Test_fmtTableCreateSQL_EdgeCases(t *testing.T) {
 			in:   "CREATE TABLE t (id int) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
 			want: "CREATE TABLE t (id int) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
 		},
+		{
+			name: "partition expression after table options does not hide auto increment",
+			in: "CREATE TABLE t (\n" +
+				"  id int NOT NULL AUTO_INCREMENT,\n" +
+				"  PRIMARY KEY (id)\n" +
+				") ENGINE=InnoDB AUTO_INCREMENT=42 PARTITION BY HASH(id) PARTITIONS 4",
+			want: "CREATE TABLE t (\n" +
+				"  id int NOT NULL AUTO_INCREMENT,\n" +
+				"  PRIMARY KEY (id)\n" +
+				") ENGINE=InnoDB PARTITION BY HASH(id) PARTITIONS 4",
+		},
+		{
+			name: "right parenthesis inside comment does not confuse definition boundary",
+			in: "CREATE TABLE t (\n" +
+				"  id int,\n" +
+				"  note varchar(20) COMMENT 'value ) here'\n" +
+				") ENGINE=InnoDB AUTO_INCREMENT=9",
+			want: "CREATE TABLE t (\n" +
+				"  id int,\n" +
+				"  note varchar(20) COMMENT 'value ) here'\n" +
+				") ENGINE=InnoDB",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

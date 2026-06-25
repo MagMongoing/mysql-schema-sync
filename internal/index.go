@@ -16,6 +16,9 @@ type DbIndex struct {
 
 	// 相关联的表
 	RelationTables []string
+
+	// 外键引用的父表字段，顺序与 REFERENCES 子句一致
+	ReferencedColumns []string
 }
 
 type indexType string
@@ -94,11 +97,13 @@ var checkConstraintReg = regexp.MustCompile(`(?i)^CONSTRAINT\s+`)
 
 func parseDbIndexLine(line string) *DbIndex {
 	line = strings.TrimSpace(line)
+	upperLine := strings.ToUpper(line)
 	idx := &DbIndex{
-		SQL:            line,
-		RelationTables: []string{},
+		SQL:               line,
+		RelationTables:    []string{},
+		ReferencedColumns: []string{},
 	}
-	if strings.HasPrefix(line, "PRIMARY") {
+	if strings.HasPrefix(upperLine, "PRIMARY") {
 		idx.IndexType = indexTypePrimary
 		idx.Name = "PRIMARY KEY"
 		return idx
@@ -123,7 +128,7 @@ func parseDbIndexLine(line string) *DbIndex {
 	// CONSTRAINT `busi_table_ibfk_1` FOREIGN KEY (`repo_id`) REFERENCES `repo_table` (`repo_id`)
 	// H5: use extractQuotedIdentifier for doubled-backtick safety in constraint
 	// and referenced-table names.
-	if foreignKeyReg.MatchString(line) && strings.Contains(line, "FOREIGN KEY") {
+	if foreignKeyReg.MatchString(line) && strings.Contains(upperLine, "FOREIGN KEY") {
 		constraintStart := strings.IndexByte(line, '`')
 		if constraintStart < 0 {
 			log.Printf("[WARN] db_index parse skipped: CONSTRAINT line without backticks: %s", line)
@@ -137,18 +142,22 @@ func parseDbIndexLine(line string) *DbIndex {
 		idx.IndexType = indexTypeForeignKey
 		idx.Name = constraintName
 		// Extract referenced table name from REFERENCES `<tbl>`
-		refIdx := strings.Index(line, "REFERENCES `")
+		refIdx := strings.Index(upperLine, "REFERENCES `")
 		if refIdx >= 0 {
-			refTable, refOk := extractQuotedIdentifier(line[refIdx+len("REFERENCES "):], '`')
+			referencePart := line[refIdx+len("REFERENCES "):]
+			refTable, refOk := extractQuotedIdentifier(referencePart, '`')
 			if refOk && refTable != "" {
 				idx.addRelationTable(refTable)
+				if tableEnd := quotedIdentifierEnd(referencePart); tableEnd > 0 {
+					idx.ReferencedColumns = parseQuotedIdentifierList(referencePart[tableEnd:])
+				}
 			}
 		}
 		return idx
 	}
 
 	// CONSTRAINT `chk_xx_1` CHECK ((`x` >= 0 and `y` <= 100))
-	if checkConstraintReg.MatchString(line) && strings.Contains(line, "CHECK") {
+	if checkConstraintReg.MatchString(line) && strings.Contains(upperLine, "CHECK") {
 		constraintStart := strings.IndexByte(line, '`')
 		if constraintStart < 0 {
 			log.Printf("[WARN] db_index parse skipped: CONSTRAINT line without backticks: %s", line)
@@ -166,4 +175,41 @@ func parseDbIndexLine(line string) *DbIndex {
 
 	log.Printf("[WARN] db_index parse skipped, unsupported line: %s", line)
 	return nil
+}
+
+func parseQuotedIdentifierList(s string) []string {
+	open := strings.IndexByte(s, '(')
+	close := strings.IndexByte(s, ')')
+	if open < 0 || close <= open {
+		return nil
+	}
+	var names []string
+	rest := s[open+1 : close]
+	for {
+		rest = strings.TrimSpace(rest)
+		if rest == "" {
+			break
+		}
+		if rest[0] != '`' {
+			return nil
+		}
+		name, ok := extractQuotedIdentifier(rest, '`')
+		if !ok || name == "" {
+			return nil
+		}
+		names = append(names, name)
+		end := quotedIdentifierEnd(rest)
+		if end < 0 {
+			return nil
+		}
+		rest = strings.TrimSpace(rest[end:])
+		if rest == "" {
+			break
+		}
+		if rest[0] != ',' {
+			return nil
+		}
+		rest = rest[1:]
+	}
+	return names
 }

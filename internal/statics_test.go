@@ -5,6 +5,7 @@
 package internal
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -318,6 +319,18 @@ func TestRedactDSNs_PasswordLengthBoundary(t *testing.T) {
 	})
 }
 
+func TestRedactDSNsShortPasswordSkipsEmbeddedAndRedactsLaterStandalone(t *testing.T) {
+	dsn := "user:pass@tcp(localhost:3306)/db"
+	msg := "compass failed; supplied password was pass"
+	got := RedactDSNs(msg, dsn)
+	if !strings.Contains(got, "compass") {
+		t.Fatalf("embedded password substring was corrupted: %q", got)
+	}
+	if strings.Contains(got, "was pass") || !strings.Contains(got, "was ***") {
+		t.Fatalf("later standalone short password was not redacted: %q", got)
+	}
+}
+
 // TestFormatTimeOrNA verifies the helper that prevents Y0001 timestamps. L12.
 func TestFormatTimeOrNA(t *testing.T) {
 	t.Run("zero time returns N/A", func(t *testing.T) {
@@ -336,4 +349,45 @@ func TestFormatTimeOrNA(t *testing.T) {
 			t.Errorf("formatTimeOrNA(%v) = %q, want %q", ts, got, want)
 		}
 	})
+}
+
+func TestStaticsHTMLIncludesFatalErrorAlongsideChanges(t *testing.T) {
+	cfg := &Config{}
+	s := newStatics(cfg)
+	s.fatalErr = fmt.Errorf("inspection failed")
+	sd := &TableAlterData{
+		Table:      "users",
+		Type:       alterTypeAlter,
+		SQL:        []string{"ALTER TABLE `users` ADD COLUMN `name` varchar(20);"},
+		SchemaDiff: newSchemaDiff("users", "CREATE TABLE `users` (\n `id` int\n)", "CREATE TABLE `users` (\n `id` int\n)"),
+	}
+	st := s.newTableStatics("users", sd, 0)
+	st.timer.stop()
+	html := s.toHTML()
+	if !strings.Contains(html, "任务失败") || !strings.Contains(html, "inspection failed") {
+		t.Fatalf("fatal error missing from report with table changes: %s", html)
+	}
+}
+
+func TestStaticsHTMLDistinguishesSkippedFromFailed(t *testing.T) {
+	cfg := &Config{Sync: true}
+	s := newStatics(cfg)
+	sd := &TableAlterData{
+		Table:      "users",
+		Type:       alterTypeAlter,
+		SQL:        []string{"ALTER TABLE `users` ADD COLUMN `name` varchar(20);"},
+		SchemaDiff: newSchemaDiff("users", "CREATE TABLE `users` (\n `id` int\n)", "CREATE TABLE `users` (\n `id` int\n)"),
+	}
+	st := s.newTableStatics("users", sd, 0)
+	st.skipped = true
+	st.skipReason = fmt.Errorf("earlier statement failed")
+	st.timer.stop()
+
+	html := s.toHTML()
+	if !strings.Contains(html, "未执行") || strings.Contains(html, "失败：earlier statement failed") {
+		t.Fatalf("skipped statement rendered as failure: %s", html)
+	}
+	if got := s.alterFailedNum(); got != 0 {
+		t.Fatalf("skipped statement counted as failed: %d", got)
+	}
 }

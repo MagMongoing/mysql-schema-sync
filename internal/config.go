@@ -100,6 +100,9 @@ type AlterIgnoreTable struct {
 // IsIgnoreField isIgnore
 func (cfg *Config) IsIgnoreField(table string, name string) bool {
 	for tableName, dit := range cfg.AlterIgnore {
+		if dit == nil {
+			continue
+		}
 		if simpleMatch(tableName, table, "IsIgnoreField_table") {
 			for _, col := range dit.Column {
 				if simpleMatch(col, name, "IsIgnoreField_colum") {
@@ -171,6 +174,9 @@ func (cfg *Config) Check() error {
 // IsIgnoreIndex is index ignore
 func (cfg *Config) IsIgnoreIndex(table string, name string) bool {
 	for tableName, dit := range cfg.AlterIgnore {
+		if dit == nil {
+			continue
+		}
 		if simpleMatch(tableName, table, "IsIgnoreIndex_table") {
 			for _, index := range dit.Index {
 				if simpleMatch(index, name, "IsIgnoreIndex_name") {
@@ -185,6 +191,9 @@ func (cfg *Config) IsIgnoreIndex(table string, name string) bool {
 // IsIgnoreForeignKey 检查外键是否忽略掉
 func (cfg *Config) IsIgnoreForeignKey(table string, name string) bool {
 	for tableName, dit := range cfg.AlterIgnore {
+		if dit == nil {
+			continue
+		}
 		if simpleMatch(tableName, table, "IsIgnoreForeignKey_table") {
 			for _, foreignName := range dit.ForeignKey {
 				if simpleMatch(foreignName, name, "IsIgnoreForeignKey_name") {

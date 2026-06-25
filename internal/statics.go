@@ -30,6 +30,8 @@ type tableStatics struct {
 	table       string
 	alter       *TableAlterData
 	alterRet    error
+	skipped     bool
+	skipReason  error
 	schemaAfter string
 }
 
@@ -50,7 +52,10 @@ func (s *statics) newTableStatics(table string, sd *TableAlterData, index int) *
 	if sd.Type == alterTypeNo {
 		return ts
 	}
-	if s.Config.SingleSchemaChange {
+	// A table can now have multiple statements even without
+	// SingleSchemaChange (for example CREATE TABLE followed by deferred foreign
+	// keys). Report the exact statement associated with this execution item.
+	if len(sd.SQL) > 1 {
 		sds := sd.Split()
 		nts := &tableStatics{}
 		*nts = *ts
@@ -89,6 +94,11 @@ func (s *statics) toHTML() string {
 		return html.EscapeString(msg)
 	}
 	code := "<h2>运行结果</h2>\n"
+	if s.fatalErr != nil {
+		msg := RedactDSNs(s.fatalErr.Error(), cfg.SourceDSN, cfg.DestDSN)
+		code += "<div style=\"border:2px solid #c00;padding:10px;color:#c00\">" +
+			"<b>任务失败：</b>" + html.EscapeString(msg) + "</div>\n"
+	}
 	code += "<h3>Tables</h3>\n"
 	code += `<table class='tb_1'>
 		<thead>
@@ -108,7 +118,9 @@ func (s *statics) toHTML() string {
 		code += "<td><a href='#detail_" + anchorID + "'>" + escapedTable + "</a></td>\n"
 		code += "<td>"
 		if s.Config.Sync {
-			if tb.alterRet == nil {
+			if tb.skipped {
+				code += "<span style=\"color:#b36b00\">未执行：" + alterErrHTML(tb.skipReason) + "</span>"
+			} else if tb.alterRet == nil {
 				code += "<span style=\"color:green\">成功</span>"
 			} else {
 				code += "<span style=\"color:red\">失败：" + alterErrHTML(tb.alterRet) + "</span>"
@@ -147,7 +159,9 @@ func (s *statics) toHTML() string {
 		code += "<th>" + strconv.Itoa(idx+1) + "</th>\n"
 		code += "<td>" + html.EscapeString(tb.table) + "<br/>"
 		if s.Config.Sync {
-			if tb.alterRet == nil {
+			if tb.skipped {
+				code += "<span style=\"color:#b36b00\">未执行：" + alterErrHTML(tb.skipReason) + "</span>"
+			} else if tb.alterRet == nil {
 				code += "<span style=\"color:green\">成功</span>"
 			} else {
 				code += "<span style=\"color:red\">失败：" + alterErrHTML(tb.alterRet) + "</span>"
@@ -202,6 +216,9 @@ func (s *statics) alterFailedNum() int {
 }
 
 func (s *statics) sendMailNotice(cfg *Config) {
+	if cfg.HTTPAddress != "" {
+		defer startWebServer(cfg.HTTPAddress, cfg)
+	}
 	alterTotal := len(s.tables)
 	if alterTotal < 1 {
 		if s.fatalErr != nil {
@@ -237,6 +254,9 @@ func (s *statics) sendMailNotice(cfg *Config) {
 		title += "[preview]"
 		body += "<span style=\"color:red\">所有 SQL 均未执行!</span>\n"
 	}
+	if s.fatalErr != nil {
+		title += " [任务失败]"
+	}
 
 	hostName, _ := os.Hostname()
 	if hostName == "" {
@@ -266,9 +286,6 @@ func (s *statics) sendMailNotice(cfg *Config) {
 	writeHTMLResult(body)
 	if cfg.Email != nil && cfg.Email.SendMailAble {
 		cfg.Email.SendMail(title, body)
-	}
-	if cfg.HTTPAddress != "" {
-		startWebServer(cfg.HTTPAddress, cfg)
 	}
 }
 
@@ -303,17 +320,20 @@ func RedactDSNs(msg string, dsns ...string) string {
 				// a standalone word (not as a substring of the DSN or other text).
 				// This prevents corrupting diagnostic messages while still catching
 				// driver errors that echo the password verbatim.
-				for {
-					idx := strings.Index(msg, pw)
-					if idx < 0 {
+				searchFrom := 0
+				for searchFrom <= len(msg)-len(pw) {
+					relative := strings.Index(msg[searchFrom:], pw)
+					if relative < 0 {
 						break
 					}
+					idx := searchFrom + relative
 					before := idx == 0 || !isAlphaNum(msg[idx-1])
 					after := idx+len(pw) >= len(msg) || !isAlphaNum(msg[idx+len(pw)])
 					if before && after {
 						msg = msg[:idx] + "***" + msg[idx+len(pw):]
+						searchFrom = idx + len("***")
 					} else {
-						break // password is embedded in a larger token; leave it
+						searchFrom = idx + len(pw)
 					}
 				}
 			}
@@ -348,13 +368,12 @@ func startWebServer(addr string, cfg *Config) {
 	// H3: refuse to bind to non-loopback addresses by default. The report
 	// page contains raw schema SQL and may carry credentials in error messages.
 	// Operators who genuinely need public access must set HTTPAllowPublic.
-	host, _, splitErr := net.SplitHostPort(addr)
-	if splitErr == nil && host != "" && host != "127.0.0.1" && host != "::1" && host != "localhost" {
-		if !httpAllowPublic {
-			log.Printf("[WARN] HTTP bind address %q is non-loopback; refusing to start server. Set -http-allow-public to override.", addr)
-			return
-		}
+	safeAddr, addrErr := safeHTTPListenAddress(addr, httpAllowPublic)
+	if addrErr != nil {
+		log.Printf("[WARN] refusing HTTP report server address %q: %s", addr, addrErr)
+		return
 	}
+	addr = safeAddr
 	fp := filepath.Join(os.TempDir(), "mysql-schema-sync_last.html")
 	if len(htmlResultPath) > 0 {
 		fp = htmlResultPath
@@ -435,6 +454,24 @@ func startWebServer(addr string, cfg *Config) {
 	// clean shutdown (ErrServerClosed) or listen failure.
 	close(done)
 	_ = ser.Close() // close idle keep-alive connections
+}
+
+func safeHTTPListenAddress(addr string, allowPublic bool) (string, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", fmt.Errorf("invalid listen address: %w", err)
+	}
+	if allowPublic {
+		return addr, nil
+	}
+	if host == "" {
+		return net.JoinHostPort("127.0.0.1", port), nil
+	}
+	ip := net.ParseIP(host)
+	if host == "localhost" || (ip != nil && ip.IsLoopback()) {
+		return addr, nil
+	}
+	return "", fmt.Errorf("non-loopback address requires -http-allow-public")
 }
 
 // isAlphaNum returns true if byte b is an ASCII alphanumeric character.

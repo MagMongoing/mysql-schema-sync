@@ -57,7 +57,9 @@ func TestWithDB(t *testing.T) {
 		// H6: capture dest schema BEFORE sync to assert it's unchanged.
 		destSchemaBefore := testCollectSchemas(t, destDB)
 
-		internal.Execute(cfg)
+		if err := internal.Execute(cfg); err != nil {
+			t.Fatalf("preview Execute failed: %v", err)
+		}
 
 		// H6: verify no schema mutations occurred when Sync=false.
 		destSchemaAfter := testCollectSchemas(t, destDB)
@@ -85,7 +87,9 @@ func TestWithDB(t *testing.T) {
 		if err := cfg.Check(); err != nil {
 			t.Fatalf("cfg.Check() failed: %v", err)
 		}
-		internal.Execute(cfg)
+		if err := internal.Execute(cfg); err != nil {
+			t.Fatalf("sync Execute failed: %v", err)
+		}
 
 		// H7: after sync with Drop=true, every source table column/index
 		// should be present in dest, and dest-only columns should be dropped.
@@ -220,7 +224,7 @@ func testCollectSchemas(t *testing.T, db *sql.DB) map[string]string {
 }
 
 // testExtractColumns extracts column names from a CREATE TABLE statement.
-// Handles doubled backticks (``) inside identifiers correctly.
+// Handles doubled backticks (“) inside identifiers correctly.
 func testExtractColumns(createTable string) []string {
 	lines := strings.Split(createTable, "\n")
 	var cols []string

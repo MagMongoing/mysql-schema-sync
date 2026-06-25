@@ -40,6 +40,10 @@ func init() {
 func main() {
 	flag.Parse()
 	internal.SetDebug(*debug)
+	visitedFlags := make(map[string]bool)
+	flag.Visit(func(f *flag.Flag) {
+		visitedFlags[f.Name] = true
+	})
 	var cfg *internal.Config
 	if len(*source) == 0 {
 		var err error
@@ -55,21 +59,7 @@ func main() {
 			log.Fatal("error: -source was specified but -dest is empty. Please provide a destination DSN.")
 		}
 	}
-	cfg.Sync = *doSync
-	cfg.Drop = *drop
-	cfg.FieldOrder = *fieldOrder
-	cfg.HTTPAddress = *httpAddress
-	cfg.SingleSchemaChange = *singleSchemaChange
-
-	if len(*mailTo) != 0 {
-		if cfg.Email != nil {
-			cfg.Email.To = *mailTo
-		} else {
-			log.Println("[WARN] -mail_to specified but no email configuration in config file; ignored")
-		}
-	}
-	cfg.SetTables(strings.Split(*tables, ","))
-	cfg.SetTablesIgnore(strings.Split(*tablesIgnore, ","))
+	applyCLIOverrides(cfg, visitedFlags)
 
 	defer (func() {
 		if re := recover(); re != nil {
@@ -106,5 +96,42 @@ func main() {
 	if err := cfg.Check(); err != nil {
 		log.Fatalf("config error: %s", err)
 	}
-	internal.Execute(cfg)
+	if err := internal.Execute(cfg); err != nil {
+		log.Printf("[FATAL] schema sync failed: %s", internal.RedactDSNs(err.Error(), cfg.SourceDSN, cfg.DestDSN))
+		os.Exit(1)
+	}
+}
+
+func applyCLIOverrides(cfg *internal.Config, visitedFlags map[string]bool) {
+	if visitedFlags["sync"] {
+		cfg.Sync = *doSync
+	}
+	if visitedFlags["drop"] {
+		cfg.Drop = *drop
+	}
+	if visitedFlags["field-order"] {
+		cfg.FieldOrder = *fieldOrder
+	}
+	if visitedFlags["http"] {
+		cfg.HTTPAddress = *httpAddress
+	}
+	if visitedFlags["single_schema_change"] {
+		cfg.SingleSchemaChange = *singleSchemaChange
+	}
+
+	if visitedFlags["mail_to"] {
+		if cfg.Email != nil {
+			cfg.Email.To = *mailTo
+		} else {
+			log.Println("[WARN] -mail_to specified but no email configuration in config file; ignored")
+		}
+	}
+	if visitedFlags["tables"] {
+		cfg.Tables = nil
+		cfg.SetTables(strings.Split(*tables, ","))
+	}
+	if visitedFlags["tables_ignore"] {
+		cfg.TablesIgnore = nil
+		cfg.SetTablesIgnore(strings.Split(*tablesIgnore, ","))
+	}
 }

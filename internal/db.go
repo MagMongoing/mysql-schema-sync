@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
@@ -12,6 +13,12 @@ import (
 
 	_ "github.com/go-sql-driver/mysql" // mysql driver
 	"github.com/xanygo/anygo/cli/xcolor"
+)
+
+const (
+	dbConnectTimeout  = 10 * time.Second
+	dbMetadataTimeout = 30 * time.Second
+	dbDDLTimeout      = 30 * time.Minute
 )
 
 // FieldInfo represents detailed field information from INFORMATION_SCHEMA.COLUMNS
@@ -370,7 +377,9 @@ func NewMyDb(dsn string, dbType dbType) (*MyDb, error) {
 	db.SetMaxOpenConns(5)
 	db.SetMaxIdleConns(2)
 	db.SetConnMaxLifetime(5 * time.Minute)
-	if err := db.Ping(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), dbConnectTimeout)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("ping db [%s] failed: %w", dsnShort(dsn), err)
 	}
@@ -392,7 +401,9 @@ func NewMyDb(dsn string, dbType dbType) (*MyDb, error) {
 func getDatabaseName(db *sql.DB) (string, error) {
 	var dbName sql.NullString
 	const query = "SELECT DATABASE()"
-	if err := db.QueryRow(query).Scan(&dbName); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), dbMetadataTimeout)
+	defer cancel()
+	if err := db.QueryRowContext(ctx, query).Scan(&dbName); err != nil {
 		log.Printf("QueryRow %q, Err=%v", query, err)
 		return "", err
 	}
@@ -404,7 +415,9 @@ func getDatabaseName(db *sql.DB) (string, error) {
 
 // GetTableNames returns all table names (excluding views) from the database
 func (db *MyDb) GetTableNames() ([]string, error) {
-	rs, err := db.Query("show table status")
+	ctx, cancel := context.WithTimeout(context.Background(), dbMetadataTimeout)
+	defer cancel()
+	rs, err := db.QueryContext(ctx, "show table status")
 	if err != nil {
 		return nil, fmt.Errorf("show tables failed: %w", err)
 	}
@@ -454,9 +467,26 @@ func (db *MyDb) GetTableNames() ([]string, error) {
 	return tables, nil
 }
 
+// HasTable reports whether a base table exists in the selected database.
+func (db *MyDb) HasTable(name string) (bool, error) {
+	const query = `
+		SELECT COUNT(*)
+		FROM INFORMATION_SCHEMA.TABLES
+		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND TABLE_TYPE = 'BASE TABLE'`
+	var count int
+	ctx, cancel := context.WithTimeout(context.Background(), dbMetadataTimeout)
+	defer cancel()
+	if err := db.sqlDB.QueryRowContext(ctx, query, db.dbName, name).Scan(&count); err != nil {
+		return false, fmt.Errorf("check table %q existence: %w", name, err)
+	}
+	return count > 0, nil
+}
+
 // GetTableSchema returns the CREATE TABLE statement for the given table
 func (db *MyDb) GetTableSchema(name string) (string, error) {
-	rs, err := db.Query(fmt.Sprintf("show create table %s", quoteIdentifier(name)))
+	ctx, cancel := context.WithTimeout(context.Background(), dbMetadataTimeout)
+	defer cancel()
+	rs, err := db.QueryContext(ctx, fmt.Sprintf("show create table %s", quoteIdentifier(name)))
 	if err != nil {
 		return "", fmt.Errorf("show create table %q failed: %w", name, err)
 	}
@@ -499,7 +529,9 @@ func (db *MyDb) TableFieldsFromInformationSchema(tableName string) (map[string]*
 		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
 		ORDER BY ORDINAL_POSITION`
 
-	rows, err := db.Query(query, db.dbName, tableName)
+	ctx, cancel := context.WithTimeout(context.Background(), dbMetadataTimeout)
+	defer cancel()
+	rows, err := db.QueryContext(ctx, query, db.dbName, tableName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query INFORMATION_SCHEMA.COLUMNS for table %q: %w", tableName, err)
 	}
@@ -569,8 +601,7 @@ func (db *MyDb) TableFieldsFromInformationSchema(tableName string) (map[string]*
 	return fields, nil
 }
 
-// Query execute sql query
-func (db *MyDb) Query(query string, args ...any) (rows *sql.Rows, err error) {
+func (db *MyDb) QueryContext(ctx context.Context, query string, args ...any) (rows *sql.Rows, err error) {
 	if debugEnabled {
 		txt := fmt.Sprintf("[%-6s: %s] [Query] Start SQL=%s Args=%s\n",
 			db.dbType,
@@ -588,11 +619,17 @@ func (db *MyDb) Query(query string, args ...any) (rows *sql.Rows, err error) {
 			log.Output(3, txt)
 		}
 	}()
-	return db.sqlDB.Query(query, args...)
+	return db.sqlDB.QueryContext(ctx, query, args...)
 }
 
 // Exec executes a SQL statement with debug logging and timing
 func (db *MyDb) Exec(query string, args ...any) (result sql.Result, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), dbDDLTimeout)
+	defer cancel()
+	return db.ExecContext(ctx, query, args...)
+}
+
+func (db *MyDb) ExecContext(ctx context.Context, query string, args ...any) (result sql.Result, err error) {
 	if debugEnabled {
 		txt := fmt.Sprintf("[%-6s: %s] [Exec]  Start SQL=%s Args=%s\n",
 			db.dbType,
@@ -610,7 +647,7 @@ func (db *MyDb) Exec(query string, args ...any) (result sql.Result, err error) {
 			log.Output(3, txt)
 		}
 	}()
-	return db.sqlDB.Exec(query, args...)
+	return db.sqlDB.ExecContext(ctx, query, args...)
 }
 
 // Close closes the database connection pool. L5: uses sync.Once for

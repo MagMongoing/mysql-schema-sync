@@ -5,12 +5,10 @@
 package internal
 
 import (
-	"fmt"
 	"regexp"
 	"strings"
 	"testing"
 
-	"github.com/go-sql-driver/mysql"
 	"github.com/xanygo/anygo/xt"
 )
 
@@ -208,6 +206,59 @@ func TestSchemaSync_Drop(t *testing.T) {
 	})
 }
 
+func TestIgnoredMissingFieldIsNotUsedAsAfterAnchor(t *testing.T) {
+	source := "CREATE TABLE `users` (\n" +
+		"  `id` int NOT NULL,\n" +
+		"  `ignored_col` int NOT NULL,\n" +
+		"  `new_col` varchar(20) NOT NULL,\n" +
+		"  PRIMARY KEY (`id`)\n" +
+		")"
+	dest := "CREATE TABLE `users` (\n" +
+		"  `id` int NOT NULL,\n" +
+		"  PRIMARY KEY (`id`)\n" +
+		")"
+	cfg := &Config{AlterIgnore: map[string]*AlterIgnoreTable{
+		"users": {Column: []string{"ignored_col"}},
+	}}
+	sc := &SchemaSync{Config: cfg}
+	got := sc.getAlterDataBySchema("users", source, dest, cfg)
+	if len(got.SQL) != 1 {
+		t.Fatalf("expected one ALTER statement, got %v", got.SQL)
+	}
+	if strings.Contains(got.SQL[0], "AFTER `ignored_col`") {
+		t.Fatalf("new field references ignored destination-missing field: %s", got.SQL[0])
+	}
+	if !strings.Contains(got.SQL[0], "AFTER `id`") {
+		t.Fatalf("new field should anchor after existing id: %s", got.SQL[0])
+	}
+}
+
+func TestIndexReplacementRemainsAtomicWithSingleSchemaChange(t *testing.T) {
+	source := "CREATE TABLE `users` (\n" +
+		"  `id` int NOT NULL,\n" +
+		"  `email` varchar(100) NOT NULL,\n" +
+		"  PRIMARY KEY (`id`),\n" +
+		"  UNIQUE KEY `uq_email` (`email`)\n" +
+		")"
+	dest := "CREATE TABLE `users` (\n" +
+		"  `id` int NOT NULL,\n" +
+		"  `email` varchar(100) NOT NULL,\n" +
+		"  PRIMARY KEY (`id`),\n" +
+		"  KEY `uq_email` (`email`)\n" +
+		")"
+	cfg := &Config{SingleSchemaChange: true}
+	sc := &SchemaSync{Config: cfg}
+	got := sc.getAlterDataBySchema("users", source, dest, cfg)
+	if len(got.SQL) != 1 {
+		t.Fatalf("index replacement must remain one ALTER, got %v", got.SQL)
+	}
+	upper := strings.ToUpper(got.SQL[0])
+	if !strings.Contains(upper, "DROP INDEX `UQ_EMAIL`") ||
+		!strings.Contains(upper, "ADD UNIQUE KEY `UQ_EMAIL`") {
+		t.Fatalf("index replacement is not atomic: %s", got.SQL[0])
+	}
+}
+
 func TestSchemaSync_SkipTimestampToDatetime(t *testing.T) {
 	// Source (production): has timestamp field
 	sourceSchema := "CREATE TABLE `orders` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,\n  `updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,\n  `name` varchar(100) NOT NULL DEFAULT '',\n  PRIMARY KEY (`id`)\n)"
@@ -383,36 +434,4 @@ func TestSchemaSync_StructuredPath(t *testing.T) {
 			t.Errorf("identical fields should produce no diff, got: %v", diffLines)
 		}
 	})
-}
-
-// TestIsMultiStatementParseError covers the safety-critical function that
-// determines whether a multi-statement DDL failure is safe to retry
-// per-statement. C1: no prior test coverage.
-func TestIsMultiStatementParseError(t *testing.T) {
-	tests := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{"nil error", nil, false},
-		{"generic error", fmt.Errorf("connection refused"), false},
-		{"wrapped generic error", fmt.Errorf("wrapped: %w", fmt.Errorf("some error")), false},
-		{"multistatements substring", fmt.Errorf("multiStatements not enabled"), true},
-		{"multi-statement substring", fmt.Errorf("multi-statement queries disabled"), true},
-		{"commands out of sync", fmt.Errorf("commands out of sync"), true},
-		{"error 1064 parse error (unsafe)", &mysql.MySQLError{Number: 1064, Message: "syntax error"}, false},
-		{"error 1148 NOT_ALLOWED_COMMAND (unsafe, may have partial commits)", &mysql.MySQLError{Number: 1148, Message: "not allowed"}, false},
-		{"error 1295 ER_UNSUPPORTED_PS (safe)", &mysql.MySQLError{Number: 1295, Message: "unsupported ps"}, true},
-		{"error 1064 with other text", fmt.Errorf("Error 1064: You have an error in your SQL syntax"), false},
-		{"wrapped mysql 1295 error", fmt.Errorf("wrapped: %w", &mysql.MySQLError{Number: 1295, Message: "ps"}), true},
-		{"unrelated mysql error 1045", &mysql.MySQLError{Number: 1045, Message: "access denied"}, false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := isMultiStatementParseError(tt.err)
-			if got != tt.want {
-				t.Errorf("isMultiStatementParseError() = %v, want %v", got, tt.want)
-			}
-		})
-	}
 }

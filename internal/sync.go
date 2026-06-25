@@ -1,7 +1,6 @@
 package internal
 
 import (
-	"errors"
 	"fmt"
 	"log"
 	"regexp"
@@ -9,7 +8,6 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/go-sql-driver/mysql"
 	"github.com/xanygo/anygo/cli/xcolor"
 )
 
@@ -92,18 +90,54 @@ func RemoveTableSchemaConfig(schema string) string {
 }
 
 func (sc *SchemaSync) getAlterDataByTable(table string, cfg *Config) (*TableAlterData, error) {
-	sSchema, err := sc.SourceDb.GetTableSchema(table)
+	sourceExists, err := sc.SourceDb.HasTable(table)
 	if err != nil {
-		return nil, fmt.Errorf("get source schema for %q: %w", table, err)
+		return nil, fmt.Errorf("check source table %q: %w", table, err)
 	}
-	dSchema, err := sc.DestDb.GetTableSchema(table)
+	destExists, err := sc.DestDb.HasTable(table)
 	if err != nil {
-		return nil, fmt.Errorf("get dest schema for %q: %w", table, err)
+		return nil, fmt.Errorf("check dest table %q: %w", table, err)
+	}
+
+	var sSchema, dSchema string
+	if sourceExists {
+		sSchema, err = sc.SourceDb.GetTableSchema(table)
+		if err != nil {
+			return nil, fmt.Errorf("get source schema for %q: %w", table, err)
+		}
+	}
+	if destExists {
+		dSchema, err = sc.DestDb.GetTableSchema(table)
+		if err != nil {
+			return nil, fmt.Errorf("get dest schema for %q: %w", table, err)
+		}
+	}
+	if sourceExists && destExists && sSchema != dSchema {
+		sourceFields, fieldsErr := sc.SourceDb.TableFieldsFromInformationSchema(table)
+		if fieldsErr != nil {
+			return nil, fmt.Errorf("get source field metadata for %q: %w", table, fieldsErr)
+		}
+		destFields, fieldsErr := sc.DestDb.TableFieldsFromInformationSchema(table)
+		if fieldsErr != nil {
+			return nil, fmt.Errorf("get dest field metadata for %q: %w", table, fieldsErr)
+		}
+		return sc.getAlterDataBySchemaWithFields(table, sSchema, dSchema, cfg, sourceFields, destFields), nil
 	}
 	return sc.getAlterDataBySchema(table, sSchema, dSchema, cfg), nil
 }
 
 func (sc *SchemaSync) getAlterDataBySchema(table string, sSchema string, dSchema string, cfg *Config) *TableAlterData {
+	return sc.getAlterDataBySchemaWithFields(table, sSchema, dSchema, cfg, nil, nil)
+}
+
+func (sc *SchemaSync) getAlterDataBySchemaWithFields(
+	table string,
+	sSchema string,
+	dSchema string,
+	cfg *Config,
+	sourceFields map[string]*FieldInfo,
+	destFields map[string]*FieldInfo,
+) *TableAlterData {
 	alter := new(TableAlterData)
 	alter.Table = table
 	alter.Type = alterTypeNo
@@ -114,28 +148,10 @@ func (sc *SchemaSync) getAlterDataBySchema(table string, sSchema string, dSchema
 		return alter
 	}
 
-	// Try to get structured field information from INFORMATION_SCHEMA.COLUMNS
-	// Only if we have database connections (not in unit tests)
-	var sourceFields, destFields map[string]*FieldInfo
-	var sourceFieldsErr, destFieldsErr error
-
-	if sc.SourceDb != nil && sc.DestDb != nil {
-		sourceFields, sourceFieldsErr = sc.SourceDb.TableFieldsFromInformationSchema(table)
-		destFields, destFieldsErr = sc.DestDb.TableFieldsFromInformationSchema(table)
-	}
-
-	// If we can get structured field information from both databases, use it for precise comparison
-	if sourceFieldsErr == nil && destFieldsErr == nil && sourceFields != nil && destFields != nil {
+	if sourceFields != nil && destFields != nil {
 		debugf("Using structured field comparison for table %q", table)
 		alter.SchemaDiff = NewSchemaDiffWithFieldInfos(table, RemoveTableSchemaConfig(sSchema), RemoveTableSchemaConfig(dSchema), sourceFields, destFields)
 	} else {
-		// Fallback to legacy text-based comparison
-		if sourceFieldsErr != nil {
-			debugf("Failed to get source fields for table %q: %s", table, errString(sourceFieldsErr))
-		}
-		if destFieldsErr != nil {
-			debugf("Failed to get dest fields for table %q: %s", table, errString(destFieldsErr))
-		}
 		debugf("Using legacy text-based comparison for table %q", table)
 		alter.SchemaDiff = newSchemaDiff(table, RemoveTableSchemaConfig(sSchema), RemoveTableSchemaConfig(dSchema))
 	}
@@ -151,7 +167,12 @@ func (sc *SchemaSync) getAlterDataBySchema(table string, sSchema string, dSchema
 	if len(dSchema) == 0 {
 		alter.Type = alterTypeCreate
 		alter.Comment = "目标数据库不存在，创建"
-		alter.SQL = append(alter.SQL, fmtTableCreateSQL(sSchema)+";")
+		createSQL, foreignKeys := splitCreateTableForeignKeys(sSchema)
+		alter.SQL = append(alter.SQL, fmtTableCreateSQL(createSQL)+";")
+		for _, foreignKey := range foreignKeys {
+			alter.SQL = append(alter.SQL,
+				fmt.Sprintf("ALTER TABLE %s\nADD %s;", quoteIdentifier(table), foreignKey))
+		}
 		return alter
 	}
 
@@ -160,17 +181,73 @@ func (sc *SchemaSync) getAlterDataBySchema(table string, sSchema string, dSchema
 		return alter
 	}
 	alter.Type = alterTypeAlter
+	var foreignDrops, regularLines, foreignAdds []string
+	for _, line := range diffLines {
+		switch {
+		case isForeignDropLine(line):
+			foreignDrops = append(foreignDrops, line)
+		case isForeignAddLine(line):
+			foreignAdds = append(foreignAdds, line)
+		default:
+			regularLines = append(regularLines, line)
+		}
+	}
+	orderedGroups := [][]string{foreignDrops, regularLines, foreignAdds}
 	if cfg.SingleSchemaChange {
-		for _, line := range diffLines {
+		for _, line := range slices.Concat(orderedGroups...) {
 			ns := fmt.Sprintf("ALTER TABLE %s\n%s;", quoteIdentifier(table), line)
 			alter.SQL = append(alter.SQL, ns)
 		}
 	} else {
-		ns := fmt.Sprintf("ALTER TABLE %s\n%s;", quoteIdentifier(table), strings.Join(diffLines, ",\n"))
-		alter.SQL = append(alter.SQL, ns)
+		for _, lines := range orderedGroups {
+			if len(lines) == 0 {
+				continue
+			}
+			ns := fmt.Sprintf("ALTER TABLE %s\n%s;", quoteIdentifier(table), strings.Join(lines, ",\n"))
+			alter.SQL = append(alter.SQL, ns)
+		}
 	}
 
 	return alter
+}
+
+func isForeignDropLine(line string) bool {
+	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(line)), "DROP FOREIGN KEY ")
+}
+
+func isForeignAddLine(line string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(line))
+	return strings.HasPrefix(upper, "ADD ") && strings.Contains(upper, " FOREIGN KEY ")
+}
+
+// splitCreateTableForeignKeys removes foreign-key constraint lines from CREATE
+// TABLE and returns them separately. This lets all tables be created before any
+// cross-table constraints are installed, including cyclic relationships.
+func splitCreateTableForeignKeys(schema string) (string, []string) {
+	lines := strings.Split(schema, "\n")
+	if len(lines) < 3 {
+		return schema, nil
+	}
+	var kept []string
+	var foreignKeys []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(strings.TrimRight(line, ","))
+		upper := strings.ToUpper(trimmed)
+		if strings.HasPrefix(upper, "CONSTRAINT ") && strings.Contains(upper, " FOREIGN KEY ") {
+			foreignKeys = append(foreignKeys, trimmed)
+			continue
+		}
+		kept = append(kept, line)
+	}
+	for i := len(kept) - 2; i >= 0; i-- {
+		trimmed := strings.TrimSpace(kept[i])
+		if trimmed == "" {
+			continue
+		}
+		kept[i] = strings.TrimRight(kept[i], " \t,")
+		break
+	}
+	return strings.Join(kept, "\n"), foreignKeys
 }
 
 func (sc *SchemaSync) getSchemaDiff(alter *TableAlterData) []string {
@@ -192,10 +269,13 @@ func (sc *SchemaSync) getSchemaDiff(alter *TableAlterData) []string {
 		for fieldName, value := range sourceMyS.Fields.Iter() {
 			if sc.Config.IsIgnoreField(table, fieldName) {
 				log.Printf("ignore column %s.%s", table, fieldName)
-				// M1 fix: always advance position tracker for ignored source fields
-				// (beforeFieldName tracks source iteration order, not dest presence).
-				beforeFieldName = fieldName
-				fieldCount++
+				// Only use an ignored field as an AFTER anchor if it actually
+				// exists in the destination. Ignored source-only fields are not
+				// created, so referencing them would produce invalid DDL.
+				if _, exists := destMyS.Fields.Get(fieldName); exists {
+					beforeFieldName = fieldName
+					fieldCount++
+				}
 				continue
 			}
 			var alterSQL string
@@ -302,8 +382,8 @@ func (sc *SchemaSync) getSchemaDiff(alter *TableAlterData) []string {
 		}
 	} else {
 		// Legacy text-based comparison fallback.
-		// In production, INFORMATION_SCHEMA is always available, so this path
-		// is only triggered in unit tests or when the INFORMATION_SCHEMA query fails.
+		// Production comparisons fail closed when INFORMATION_SCHEMA cannot be
+		// queried, so this path is limited to direct schema-based unit tests.
 		// Note: This path uses raw SHOW CREATE TABLE text for SQL generation rather
 		// than FieldInfo.String(). Full unification would require parsing FieldInfo
 		// from raw text, which is not cost-effective given this path's limited use.
@@ -312,9 +392,10 @@ func (sc *SchemaSync) getSchemaDiff(alter *TableAlterData) []string {
 		for fieldName, value := range sourceMyS.Fields.Iter() {
 			if sc.Config.IsIgnoreField(table, fieldName) {
 				log.Printf("ignore column %s.%s", table, fieldName)
-				// M1 fix: always advance position tracker for ignored source fields.
-				beforeFieldName = fieldName
-				fieldCount++
+				if _, exists := destMyS.Fields.Get(fieldName); exists {
+					beforeFieldName = fieldName
+					fieldCount++
+				}
 				continue
 			}
 			var alterSQL string
@@ -351,6 +432,7 @@ func (sc *SchemaSync) getSchemaDiff(alter *TableAlterData) []string {
 		}
 	}
 
+	var dropColumnLines []string
 	// 源库已经删除的字段
 	if sc.Config.Drop {
 		for _, name := range destMyS.Fields.Keys() {
@@ -360,7 +442,7 @@ func (sc *SchemaSync) getSchemaDiff(alter *TableAlterData) []string {
 			}
 			if _, has := sourceMyS.Fields.Get(name); !has {
 				alterSQL := fmt.Sprintf("DROP COLUMN %s", quoteIdentifier(name))
-				alterLines = append(alterLines, alterSQL)
+				dropColumnLines = append(dropColumnLines, alterSQL)
 				debugf("check column.drop %s.%s alterSQL=%s", table, name, alterSQL)
 			} else {
 				debugf("check column.drop %s.%s not change", table, name)
@@ -370,6 +452,7 @@ func (sc *SchemaSync) getSchemaDiff(alter *TableAlterData) []string {
 
 	// 多余的字段暂不删除
 
+	var dropIndexLines, replaceIndexLines, addIndexLines []string
 	// 比对索引（sorted for deterministic output）
 	for _, indexName := range sortedMapKeys(sourceMyS.IndexAll) {
 		idx := sourceMyS.IndexAll[indexName]
@@ -379,19 +462,24 @@ func (sc *SchemaSync) getSchemaDiff(alter *TableAlterData) []string {
 		}
 		dIdx, has := destMyS.IndexAll[indexName]
 		debugf("indexName---->[%s.%s] dest_has:%v\ndest_idx:%v\nsource_idx:%v", table, indexName, has, dIdx, idx)
-		var alterSQLs []string
 		if has {
 			if idx.SQL != dIdx.SQL {
-				alterSQLs = append(alterSQLs, idx.alterAddSQL(true)...)
+				dropSQL := dIdx.alterDropSQL()
+				addSQLs := idx.alterAddSQL(false)
+				if dropSQL != "" && len(addSQLs) > 0 {
+					// Keep replacement in one ALTER TABLE even when
+					// SingleSchemaChange is enabled. This avoids permanently
+					// losing the old index if the replacement cannot be added,
+					// and is required for AUTO_INCREMENT primary keys.
+					replaceIndexLines = append(replaceIndexLines, dropSQL+", "+strings.Join(addSQLs, ", "))
+				}
+				debugf("check index.alter %s.%s changed", table, indexName)
+			} else {
+				debugf("check index.alter %s.%s not change", table, indexName)
 			}
 		} else {
-			alterSQLs = append(alterSQLs, idx.alterAddSQL(false)...)
-		}
-		if len(alterSQLs) > 0 {
-			alterLines = append(alterLines, alterSQLs...)
-			debugf("check index.alter %s.%s alterSQL=%s", table, indexName, alterSQLs)
-		} else {
-			debugf("check index.alter %s.%s not change", table, indexName)
+			addIndexLines = append(addIndexLines, idx.alterAddSQL(false)...)
+			debugf("check index.add %s.%s", table, indexName)
 		}
 	}
 
@@ -409,7 +497,7 @@ func (sc *SchemaSync) getSchemaDiff(alter *TableAlterData) []string {
 			}
 
 			if len(dropSQL) != 0 {
-				alterLines = append(alterLines, dropSQL)
+				dropIndexLines = append(dropIndexLines, dropSQL)
 				debugf("check index.drop %s.%s alterSQL=%s", table, indexName, dropSQL)
 			} else {
 				debugf("check index.drop %s.%s not change", table, indexName)
@@ -417,6 +505,7 @@ func (sc *SchemaSync) getSchemaDiff(alter *TableAlterData) []string {
 		}
 	}
 
+	var dropForeignLines, addForeignLines []string
 	// 比对外键（sorted for deterministic output）
 	for _, foreignName := range sortedMapKeys(sourceMyS.ForeignAll) {
 		idx := sourceMyS.ForeignAll[foreignName]
@@ -426,19 +515,19 @@ func (sc *SchemaSync) getSchemaDiff(alter *TableAlterData) []string {
 		}
 		dIdx, has := destMyS.ForeignAll[foreignName]
 		debugf("foreignName---->[%s.%s] dest_has:%v\ndest_idx:%v\nsource_idx:%v", table, foreignName, has, dIdx, idx)
-		var alterSQLs []string
 		if has {
 			if idx.SQL != dIdx.SQL {
-				alterSQLs = append(alterSQLs, idx.alterAddSQL(true)...)
+				if dropSQL := dIdx.alterDropSQL(); dropSQL != "" {
+					dropForeignLines = append(dropForeignLines, dropSQL)
+				}
+				addForeignLines = append(addForeignLines, idx.alterAddSQL(false)...)
+				debugf("check foreignKey.alter %s.%s changed", table, foreignName)
+			} else {
+				debugf("check foreignKey.alter %s.%s not change", table, foreignName)
 			}
 		} else {
-			alterSQLs = append(alterSQLs, idx.alterAddSQL(false)...)
-		}
-		if len(alterSQLs) > 0 {
-			alterLines = append(alterLines, alterSQLs...)
-			debugf("check foreignKey.alter %s.%s alterSQL=%s", table, foreignName, alterSQLs)
-		} else {
-			debugf("check foreignKey.alter %s.%s not change", table, foreignName)
+			addForeignLines = append(addForeignLines, idx.alterAddSQL(false)...)
+			debugf("check foreignKey.add %s.%s", table, foreignName)
 		}
 	}
 
@@ -456,7 +545,7 @@ func (sc *SchemaSync) getSchemaDiff(alter *TableAlterData) []string {
 				dropSQL = dIdx.alterDropSQL()
 			}
 			if len(dropSQL) != 0 {
-				alterLines = append(alterLines, dropSQL)
+				dropForeignLines = append(dropForeignLines, dropSQL)
 				debugf("check foreignKey.drop %s.%s alterSQL=%s", table, foreignName, dropSQL)
 			} else {
 				debugf("check foreignKey.drop %s.%s not change", table, foreignName)
@@ -464,7 +553,17 @@ func (sc *SchemaSync) getSchemaDiff(alter *TableAlterData) []string {
 		}
 	}
 
-	return alterLines
+	// Destructive dependencies must be removed before columns; indexes are
+	// restored after column changes, and foreign keys are always installed last.
+	return slices.Concat(
+		dropForeignLines,
+		dropIndexLines,
+		dropColumnLines,
+		alterLines,
+		replaceIndexLines,
+		addIndexLines,
+		addForeignLines,
+	)
 }
 
 // sortedMapKeys returns sorted keys from a map[string]*DbIndex for deterministic iteration
@@ -477,44 +576,6 @@ func sortedMapKeys(m map[string]*DbIndex) []string {
 	return keys
 }
 
-// isMultiStatementParseError returns true ONLY when the driver/server rejected
-// the multi-statement payload up-front — meaning no statements have executed.
-// MySQL signals per-statement parse errors (ER_PARSE_ERROR = 1064) at the
-// boundary between statements, but by then earlier DDL may already have been
-// implicitly committed. We therefore treat 1064 as a NON-safe indicator and
-// only trust driver-level rejection text (e.g. "multiStatements" disabled,
-// "commands out of sync") as proof that nothing was committed.
-func isMultiStatementParseError(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := strings.ToLower(err.Error())
-	// Driver-level indicators that the multi-statement form was rejected
-	// before any statement was executed:
-	if strings.Contains(msg, "multistatements") || strings.Contains(msg, "multi-statement") {
-		return true
-	}
-	if strings.Contains(msg, "commands out of sync") {
-		return true
-	}
-	// CRITICAL: Do NOT match "error 1064" or "you have an error in your sql
-	// syntax" here. MySQL returns these for per-statement parse errors, where
-	// earlier statements may already have been implicitly committed (DDL
-	// implicit commit). Falling back to per-statement execution would re-run
-	// committed DDL and mask the real error.
-	//
-	// Also check for a typed *mysql.MySQLError: only ER_NOT_ALLOWED_COMMAND
-	// (1148) or similar driver-level codes are safe. 1064 is NOT safe here.
-	var mysqlErr *mysql.MySQLError
-	if errors.As(err, &mysqlErr) {
-		switch mysqlErr.Number {
-		case 1295: // ER_UNSUPPORTED_PS — prepared-statement protocol doesn't support multi
-			return true
-		}
-	}
-	return false
-}
-
 // SyncSQL4Dest sync schema change
 func (sc *SchemaSync) SyncSQL4Dest(sqlStr string, sqls []string) error {
 	sqlStr = strings.TrimSpace(sqlStr)
@@ -525,63 +586,24 @@ func (sc *SchemaSync) SyncSQL4Dest(sqlStr string, sqls []string) error {
 		return nil
 	}
 	t := newMyTimer()
-	ret, err := sc.DestDb.Query(sqlStr)
-	if ret != nil {
-		// Iterate all result sets to detect errors from 2nd+ statements in multi-statement queries.
-		// Some drivers surface errors only after iteration / Close; we collect from both NextResultSet
-		// loop and Close() to avoid losing failures from the first statement.
-		for ret.NextResultSet() {
-			// drain result sets; errors are captured below
+	var successCount int
+	for i, statement := range sqls {
+		statement = strings.TrimSpace(strings.TrimRight(statement, ";"))
+		if statement == "" {
+			continue
 		}
-		rsErr := ret.Err()
-		closeErr := ret.Close()
-		ret = nil
-		// M13: join all error causes so no root cause is silently dropped.
-		err = errors.Join(err, rsErr, closeErr)
-	}
-
-	// If the multi-statement send failed because the driver/server did not accept
-	// the multi-statement form (allowMultiQueries not enabled, or first-statement
-	// parse error), we can safely fall back to per-statement Exec — at that point
-	// nothing has been committed.
-	//
-	// CRITICAL: We must NOT fall back if the multi-statement send was *partially*
-	// applied. DDL causes implicit COMMIT in MySQL, so re-running statements that
-	// already succeeded would fail with "duplicate"/"already exists" and report
-	// the wrong root cause. We therefore only fall back when the error pattern
-	// matches "multi-statement not enabled" / "syntax error at the start".
-	if err != nil && len(sqls) > 1 && isMultiStatementParseError(err) {
-		originalErr := err
-		log.Println("Exec_mut_query parse-failed, err=", errString(originalErr), ", now try exec SQLs foreach")
-		var failErrs []error
-		var successCount int
-		for i, sql := range sqls {
-			_, err = sc.DestDb.Exec(sql)
-			log.Println("exec_one:[", sql, "]", errString(err))
-			if err != nil {
-				failErrs = append(failErrs, fmt.Errorf("statement %d failed: %w", i+1, err))
-				continue
-			}
-			successCount++
+		_, err := sc.DestDb.Exec(statement)
+		log.Println("exec_one:[", statement, "]", errString(err))
+		if err != nil {
+			t.stop()
+			retErr := fmt.Errorf("DDL execution stopped after %d/%d succeeded; statement %d failed: %w",
+				successCount, len(sqls), i+1, err)
+			log.Println("EXEC_SQL_FAILED:", errString(retErr))
+			return retErr
 		}
-		if len(failErrs) > 0 {
-			log.Printf("[WARN] %d of %d DDL statements succeeded, %d failed (DDL implicit commit — partial changes may exist)", successCount, len(sqls), len(failErrs))
-			err = fmt.Errorf("fallback exec: %d/%d succeeded: %w", successCount, len(sqls), errors.Join(failErrs...))
-		} else {
-			err = nil
-		}
-	} else if err != nil && len(sqls) > 1 {
-		// Multi-statement was accepted but a later statement failed: earlier DDL
-		// has already been implicitly committed. Do NOT retry — surface the
-		// original error so the operator can manually reconcile.
-		log.Printf("[WARN] multi-statement DDL partially applied (DDL implicit commit) — NOT retrying. Original error: %s", errString(err))
-		err = fmt.Errorf("multi-statement DDL partially applied (DDL implicit commit, not retried): %w", err)
+		successCount++
 	}
 	t.stop()
-	if err != nil {
-		log.Println("EXEC_SQL_FAILED:", errString(err))
-		return err
-	}
 	log.Println("EXEC_SQL_SUCCESS, used:", t.usedSecond())
 	return nil
 }

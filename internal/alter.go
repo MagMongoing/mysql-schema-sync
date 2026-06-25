@@ -83,17 +83,56 @@ func (ta *TableAlterData) String() string {
 var autoIncrReg = regexp.MustCompile(`(?i)\s+AUTO_INCREMENT=\d+\b`)
 
 func fmtTableCreateSQL(sql string) string {
-	// L10: Only strip AUTO_INCREMENT from the table-options region (after the
-	// last ')' that closes column definitions). This prevents matching inside
-	// column COMMENT string literals which could corrupt the DDL.
-	lastParen := strings.LastIndex(sql, ")")
-	if lastParen < 0 {
+	// Only strip AUTO_INCREMENT from the table-options region after the
+	// matching ')' of CREATE TABLE's column-definition list. Using the last ')'
+	// is incorrect for partition clauses and table options containing
+	// parenthesized expressions.
+	definitionEnd := findCreateTableDefinitionEnd(sql)
+	if definitionEnd < 0 {
 		// No closing paren — fall back to applying on the whole string
 		return strings.TrimRightFunc(autoIncrReg.ReplaceAllString(sql, ""), unicode.IsSpace)
 	}
-	prefix := sql[:lastParen+1]
-	suffix := sql[lastParen+1:]
+	prefix := sql[:definitionEnd+1]
+	suffix := sql[definitionEnd+1:]
 	suffix = autoIncrReg.ReplaceAllString(suffix, "")
 	result := prefix + suffix
 	return strings.TrimRightFunc(result, unicode.IsSpace)
+}
+
+func findCreateTableDefinitionEnd(sql string) int {
+	start := strings.IndexByte(sql, '(')
+	if start < 0 {
+		return -1
+	}
+	depth := 0
+	var quote byte
+	for i := start; i < len(sql); i++ {
+		ch := sql[i]
+		if quote != 0 {
+			if ch == '\\' && quote != '`' {
+				i++
+				continue
+			}
+			if ch == quote {
+				if i+1 < len(sql) && sql[i+1] == quote {
+					i++
+					continue
+				}
+				quote = 0
+			}
+			continue
+		}
+		switch ch {
+		case '\'', '"', '`':
+			quote = ch
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
 }
