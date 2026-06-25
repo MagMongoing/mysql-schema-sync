@@ -21,5 +21,8 @@ func (mt *myTimer) stop() {
 }
 
 func (mt *myTimer) usedSecond() string {
+	if mt.end.IsZero() {
+		return "N/A"
+	}
 	return fmt.Sprintf("%f s", mt.end.Sub(mt.start).Seconds())
 }

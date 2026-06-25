@@ -567,6 +567,81 @@ func TestIsTimestampDatetimeEquivalent(t *testing.T) {
 	}
 }
 
+func TestFieldInfo_String_CurrentTimestampPrecision(t *testing.T) {
+	tests := []struct {
+		name  string
+		field *FieldInfo
+		want  string
+	}{
+		{
+			name: "CURRENT_TIMESTAMP(3) with fractional seconds",
+			field: &FieldInfo{
+				ColumnName:    "created_at",
+				ColumnType:    "timestamp(3)",
+				IsNullAble:    "NO",
+				DataType:      "timestamp",
+				ColumnDefault: stringPtr("CURRENT_TIMESTAMP(3)"),
+				Extra:         "on update CURRENT_TIMESTAMP(3)",
+			},
+			want: "`created_at` timestamp(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)",
+		},
+		{
+			name: "CURRENT_TIMESTAMP(6) microsecond precision",
+			field: &FieldInfo{
+				ColumnName:    "created_at",
+				ColumnType:    "datetime(6)",
+				IsNullAble:    "YES",
+				DataType:      "datetime",
+				ColumnDefault: stringPtr("CURRENT_TIMESTAMP(6)"),
+			},
+			want: "`created_at` datetime(6) NULL DEFAULT CURRENT_TIMESTAMP(6)",
+		},
+		{
+			name: "DEFAULT_GENERATED filtered from Extra (MySQL 8.0)",
+			field: &FieldInfo{
+				ColumnName:    "updated_at",
+				ColumnType:    "timestamp",
+				IsNullAble:    "NO",
+				DataType:      "timestamp",
+				ColumnDefault: stringPtr("CURRENT_TIMESTAMP"),
+				Extra:         "DEFAULT_GENERATED on update CURRENT_TIMESTAMP",
+			},
+			want: "`updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+		},
+		{
+			name: "DEFAULT_GENERATED alone in Extra is filtered out completely",
+			field: &FieldInfo{
+				ColumnName:    "created_at",
+				ColumnType:    "timestamp",
+				IsNullAble:    "NO",
+				DataType:      "timestamp",
+				ColumnDefault: stringPtr("CURRENT_TIMESTAMP"),
+				Extra:         "DEFAULT_GENERATED",
+			},
+			want: "`created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP",
+		},
+		{
+			name: "field with comment containing single quote",
+			field: &FieldInfo{
+				ColumnName:    "status",
+				ColumnType:    "tinyint",
+				IsNullAble:    "NO",
+				DataType:      "tinyint",
+				ColumnDefault: stringPtr("0"),
+				ColumnComment: "user's status",
+			},
+			want: "`status` tinyint NOT NULL DEFAULT 0 COMMENT 'user''s status'",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.field.String()
+			xt.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestIsTextTimestampDatetimeSkip(t *testing.T) {
 	tests := []struct {
 		name       string

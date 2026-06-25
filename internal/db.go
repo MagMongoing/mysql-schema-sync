@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -19,28 +20,53 @@ type FieldInfo struct {
 	ColumnDefault          *string `json:"column_default"`
 	IsNullAble             string  `json:"is_nullable"`
 	DataType               string  `json:"data_type"`
-	CharacterMaximumLength *int    `json:"character_maximum_length"`
-	NumericPrecision       *int    `json:"numeric_precision"`
-	NumericScale           *int    `json:"numeric_scale"`
+	CharacterMaximumLength *int64  `json:"character_maximum_length"`
+	NumericPrecision       *int64  `json:"numeric_precision"`
+	NumericScale           *int64  `json:"numeric_scale"`
 	CharsetName            *string `json:"character_set_name"`
 	CollationName          *string `json:"collation_name"`
 	ColumnType             string  `json:"column_type"`
 	ColumnComment          string  `json:"column_comment"`
 	Extra                  string  `json:"extra"`
+	GenerationExpression   string  `json:"generation_expression"`
 }
+
+// stringTypesNeedQuoted lists data types that require quoted default values in SQL
+var stringTypesNeedQuoted = []string{
+	"char", "varchar", "binary", "varbinary",
+	"tinyblob", "blob", "mediumblob", "longblob",
+	"tinytext", "text", "mediumtext", "longtext",
+	"enum", "set", "json",
+}
+
+// currentTimestampReg matches CURRENT_TIMESTAMP with optional fractional seconds precision
+var currentTimestampReg = regexp.MustCompile(`(?i)^CURRENT_TIMESTAMP(\(\d+\))?$`)
 
 // needsQuotedDefault returns true if the field type requires quoted default values
 func (f *FieldInfo) needsQuotedDefault() bool {
-	// String types that need quoted default values
-	stringTypes := []string{
-		"char", "varchar", "binary", "varbinary",
-		"tinyblob", "blob", "mediumblob", "longblob",
-		"tinytext", "text", "mediumtext", "longtext",
-		"enum", "set", "json",
-	}
-
 	dataType := strings.ToLower(f.DataType)
-	return slices.Contains(stringTypes, dataType)
+	return slices.Contains(stringTypesNeedQuoted, dataType)
+}
+
+// isCharacterType returns true if the field has a character-based data type that supports charset/collation
+func (f *FieldInfo) isCharacterType() bool {
+	dataType := strings.ToLower(f.DataType)
+	// Character types that support CHARACTER SET / COLLATE
+	charTypes := []string{"char", "varchar", "tinytext", "text", "mediumtext", "longtext", "enum", "set"}
+	return slices.Contains(charTypes, dataType)
+}
+
+// isExpressionDefault returns true if the default value is a MySQL 8.0.13+ expression.
+// Expression defaults are wrapped in parentheses, e.g. (UUID()), (JSON_OBJECT(...)).
+// Hex literal defaults (0x...) are also treated as expressions.
+func isExpressionDefault(val string) bool {
+	if len(val) >= 2 && val[0] == '(' && val[len(val)-1] == ')' {
+		return true
+	}
+	if len(val) >= 2 && val[0] == '0' && (val[1] == 'x' || val[1] == 'X') {
+		return true
+	}
+	return false
 }
 
 // String returns the full column definition as used in CREATE TABLE
@@ -48,7 +74,19 @@ func (f *FieldInfo) String() string {
 	var parts []string
 
 	// Column name and type
-	parts = append(parts, fmt.Sprintf("`%s` %s", f.ColumnName, f.ColumnType))
+	parts = append(parts, fmt.Sprintf("%s %s", quoteIdentifier(f.ColumnName), f.ColumnType))
+
+	// CHARACTER SET and COLLATE:
+	// Not emitted here intentionally. MySQL's SHOW CREATE TABLE only includes
+	// CHARACTER SET/COLLATE when they differ from the table default. Since String()
+	// doesn't know the table default, emitting them would produce incorrect DDL.
+	// The raw SHOW CREATE TABLE text (which already contains correct charset clauses)
+	// is used directly for CHANGE/MODIFY statements wherever available.
+
+	// Generated column expression (GENERATED ALWAYS AS ...)
+	if f.GenerationExpression != "" {
+		parts = append(parts, fmt.Sprintf("GENERATED ALWAYS AS (%s)", f.GenerationExpression))
+	}
 
 	// NULL/NOT NULL
 	if strings.ToUpper(f.IsNullAble) == "NO" {
@@ -57,32 +95,57 @@ func (f *FieldInfo) String() string {
 		parts = append(parts, "NULL")
 	}
 
-	// Default value
-	if f.ColumnDefault != nil {
+	// Default value (generated columns don't have defaults)
+	if f.ColumnDefault != nil && f.GenerationExpression == "" {
 		defaultValue := *f.ColumnDefault
 		upperDefault := strings.ToUpper(defaultValue)
 
 		// Special keywords that don't need quotes
-		if upperDefault == "CURRENT_TIMESTAMP" || upperDefault == "NULL" {
-			parts = append(parts, fmt.Sprintf("DEFAULT %s", upperDefault))
+		if upperDefault == "NULL" {
+			parts = append(parts, "DEFAULT NULL")
+		} else if currentTimestampReg.MatchString(defaultValue) {
+			parts = append(parts, fmt.Sprintf("DEFAULT %s", strings.ToUpper(defaultValue)))
+		} else if isExpressionDefault(defaultValue) {
+			// MySQL 8.0.13+ expression defaults (e.g., (UUID()), hex literals)
+			// are emitted as-is without additional quoting
+			parts = append(parts, fmt.Sprintf("DEFAULT %s", defaultValue))
 		} else if f.needsQuotedDefault() {
-			// String types need quotes
-			parts = append(parts, fmt.Sprintf("DEFAULT '%s'", defaultValue))
+			// String types need quotes; escape backslashes first, then single quotes
+			escapedDefault := strings.ReplaceAll(defaultValue, "\\", "\\\\")
+			escapedDefault = strings.ReplaceAll(escapedDefault, "'", "''")
+			parts = append(parts, fmt.Sprintf("DEFAULT '%s'", escapedDefault))
 		} else {
 			// Numeric types don't need quotes
 			parts = append(parts, fmt.Sprintf("DEFAULT %s", defaultValue))
 		}
 	}
 
-	// Extra
+	// Extra (filter out DEFAULT_GENERATED and GENERATED markers handled separately)
 	if f.Extra != "" {
-		parts = append(parts, strings.ToUpper(f.Extra))
+		extra := f.Extra
+		extra = strings.ReplaceAll(extra, "DEFAULT_GENERATED", "")
+		extra = strings.ReplaceAll(extra, "VIRTUAL GENERATED", "")
+		extra = strings.ReplaceAll(extra, "STORED GENERATED", "")
+		extra = strings.TrimSpace(extra)
+		if extra != "" {
+			parts = append(parts, strings.ToUpper(extra))
+		}
+	}
+
+	// Virtual/Stored keyword for generated columns (after NULL/NOT NULL)
+	if f.GenerationExpression != "" {
+		if strings.Contains(f.Extra, "STORED") {
+			parts = append(parts, "STORED")
+		} else {
+			parts = append(parts, "VIRTUAL")
+		}
 	}
 
 	// Comment
 	if f.ColumnComment != "" {
-		// Escape single quotes in comment by doubling them
-		escapedComment := strings.ReplaceAll(f.ColumnComment, "'", "''")
+		// Escape backslashes first, then single quotes by doubling them
+		escapedComment := strings.ReplaceAll(f.ColumnComment, "\\", "\\\\")
+		escapedComment = strings.ReplaceAll(escapedComment, "'", "''")
 		parts = append(parts, fmt.Sprintf("COMMENT '%s'", escapedComment))
 	}
 
@@ -100,7 +163,7 @@ func (f *FieldInfo) Equals(other *FieldInfo) bool {
 		f.IsNullAble != other.IsNullAble ||
 		f.DataType != other.DataType ||
 		f.ColumnComment != other.ColumnComment ||
-		f.Extra != other.Extra {
+		normalizeExtra(f.Extra) != normalizeExtra(other.Extra) {
 		return false
 	}
 
@@ -132,7 +195,18 @@ func (f *FieldInfo) Equals(other *FieldInfo) bool {
 		return false
 	}
 
+	// Compare generation expression for generated columns
+	if f.GenerationExpression != other.GenerationExpression {
+		return false
+	}
+
 	return true
+}
+
+// normalizeExtra strips MySQL-version-specific markers from Extra for cross-version comparison
+func normalizeExtra(extra string) string {
+	extra = strings.ReplaceAll(extra, "DEFAULT_GENERATED", "")
+	return strings.TrimSpace(extra)
 }
 
 // isTimestampDatetimeEquivalent checks if two fields only differ in timestamp vs datetime type.
@@ -150,8 +224,12 @@ func isTimestampDatetimeEquivalent(source, dest *FieldInfo) bool {
 	// Create a copy of dest with timestamp type to compare everything else
 	destCopy := *dest
 	destCopy.DataType = "timestamp"
-	destCopy.ColumnType = strings.Replace(destCopy.ColumnType, "datetime", "timestamp", 1)
-	destCopy.ColumnType = strings.Replace(destCopy.ColumnType, "DATETIME", "timestamp", 1)
+	// Normalize to lowercase before replacing to handle any case variation
+	lowerColType := strings.ToLower(destCopy.ColumnType)
+	if len(lowerColType) < len("datetime") {
+		return false
+	}
+	destCopy.ColumnType = "timestamp" + lowerColType[len("datetime"):]
 
 	return source.Equals(&destCopy)
 }
@@ -184,13 +262,23 @@ func isTextTimestampDatetimeSkip(sourceText, destText string) bool {
 }
 
 // stripFieldNamePrefix removes the backtick-quoted column name from a field definition line.
+// Handles doubled backticks correctly via extractQuotedIdentifier.
 // e.g., "`created_at` timestamp NOT NULL" → "timestamp NOT NULL"
 func stripFieldNamePrefix(s string) string {
 	s = strings.TrimSpace(s)
 	if len(s) > 0 && s[0] == '`' {
-		idx := strings.Index(s[1:], "`")
-		if idx >= 0 {
-			return strings.TrimSpace(s[idx+2:])
+		// Find end of identifier (handles doubled backticks)
+		i := 1
+		for i < len(s) {
+			if s[i] == '`' {
+				if i+1 < len(s) && s[i+1] == '`' {
+					i += 2 // skip doubled backtick
+					continue
+				}
+				// Single closing backtick — identifier ends here
+				return strings.TrimSpace(s[i+1:])
+			}
+			i++
 		}
 	}
 	return s
@@ -214,48 +302,34 @@ func replaceDatetimeType(s string) string {
 	return s
 }
 
-// charsetEquals checks if character sets are semantically equal
+// charsetEquals checks if character sets are semantically equal.
+// When one side is nil (inherits table default) and the other is explicit,
+// we treat them as equal to avoid false-positive diffs across MySQL versions.
 func (f *FieldInfo) charsetEquals(other *FieldInfo) bool {
-	// Both NULL
+	// Both NULL - equal
 	if f.CharsetName == nil && other.CharsetName == nil {
 		return true
 	}
-
-	// One NULL, one not NULL
+	// One NULL, one set - treat as equal (nil inherits table default, which we can't determine)
 	if (f.CharsetName == nil) != (other.CharsetName == nil) {
-		// If one is NULL, check if the other is the default charset
-		if f.CharsetName != nil {
-			return *f.CharsetName == "utf8mb4" || *f.CharsetName == "utf8" || *f.CharsetName == "latin1"
-		}
-		return *other.CharsetName == "utf8mb4" || *other.CharsetName == "utf8" || *other.CharsetName == "latin1"
+		return true
 	}
-
 	// Both not NULL, compare values
 	return *f.CharsetName == *other.CharsetName
 }
 
-// collationEquals checks if collations are semantically equal
+// collationEquals checks if collations are semantically equal.
+// When one side is nil (inherits table default) and the other is explicit,
+// we treat them as equal to avoid false-positive diffs across MySQL versions.
 func (f *FieldInfo) collationEquals(other *FieldInfo) bool {
-	// Both NULL
+	// Both NULL - equal
 	if f.CollationName == nil && other.CollationName == nil {
 		return true
 	}
-
-	// One NULL, one not NULL
+	// One NULL, one set - treat as equal (nil inherits table default, which we can't determine)
 	if (f.CollationName == nil) != (other.CollationName == nil) {
-		// If one is NULL, check if the other is the default collation
-		if f.CollationName != nil {
-			return *f.CollationName == "utf8mb4_general_ci" ||
-				*f.CollationName == "utf8mb4_unicode_ci" ||
-				*f.CollationName == "utf8_general_ci" ||
-				*f.CollationName == "latin1_swedish_ci"
-		}
-		return *other.CollationName == "utf8mb4_general_ci" ||
-			*other.CollationName == "utf8mb4_unicode_ci" ||
-			*other.CollationName == "utf8_general_ci" ||
-			*other.CollationName == "latin1_swedish_ci"
+		return true
 	}
-
 	// Both not NULL, compare values
 	return *f.CollationName == *other.CollationName
 }
@@ -274,21 +348,29 @@ type MyDb struct {
 	dbName string // 数据库名称
 }
 
-// NewMyDb parse dsn
-func NewMyDb(dsn string, dbType dbType) *MyDb {
+// NewMyDb creates a new MyDb connection, verifies it with Ping, and returns the database name
+func NewMyDb(dsn string, dbType dbType) (*MyDb, error) {
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
-		panic(fmt.Sprintf("connected to db [%s] failed,err=%s", dsn, err))
+		return nil, fmt.Errorf("connect to db [%s] failed: %w", dsnShort(dsn), err)
+	}
+	db.SetMaxOpenConns(5)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("ping db [%s] failed: %w", dsnShort(dsn), err)
 	}
 	dbName, err := getDatabaseName(db)
 	if err != nil {
-		panic(fmt.Sprintf("get database name failed,err=%s", err))
+		db.Close()
+		return nil, fmt.Errorf("get database name failed: %w", err)
 	}
 	return &MyDb{
 		sqlDB:  db,
 		dbType: dbType,
 		dbName: dbName,
-	}
+	}, nil
 }
 
 // getDatabaseName extracts database name from the current database connection
@@ -302,16 +384,19 @@ func getDatabaseName(db *sql.DB) (string, error) {
 	return dbName, err
 }
 
-// GetTableNames table names
-func (db *MyDb) GetTableNames() []string {
+// GetTableNames returns all table names (excluding views) from the database
+func (db *MyDb) GetTableNames() ([]string, error) {
 	rs, err := db.Query("show table status")
 	if err != nil {
-		panic("show tables failed:" + err.Error())
+		return nil, fmt.Errorf("show tables failed: %w", err)
 	}
 	defer rs.Close()
 
 	var tables []string
-	columns, _ := rs.Columns()
+	columns, err := rs.Columns()
+	if err != nil {
+		return nil, fmt.Errorf("show tables columns: %w", err)
+	}
 	for rs.Next() {
 		var values = make([]any, len(columns))
 		valuePtrs := make([]any, len(columns))
@@ -319,7 +404,7 @@ func (db *MyDb) GetTableNames() []string {
 			valuePtrs[i] = &values[i]
 		}
 		if err := rs.Scan(valuePtrs...); err != nil {
-			panic("show tables failed when scan," + err.Error())
+			return nil, fmt.Errorf("show tables scan failed: %w", err)
 		}
 		var valObj = make(map[string]any)
 		for i, col := range columns {
@@ -334,26 +419,39 @@ func (db *MyDb) GetTableNames() []string {
 			valObj[col] = v
 		}
 		if valObj["Engine"] != nil {
-			tables = append(tables, valObj["Name"].(string))
+			name, ok := valObj["Name"].(string)
+			if ok {
+				tables = append(tables, name)
+			}
 		}
 	}
-	return tables
+	if err := rs.Err(); err != nil {
+		return nil, fmt.Errorf("iterate table status: %w", err)
+	}
+	return tables, nil
 }
 
-// GetTableSchema table schema
-func (db *MyDb) GetTableSchema(name string) (schema string) {
-	rs, err := db.Query(fmt.Sprintf("show create table `%s`", name))
+// GetTableSchema returns the CREATE TABLE statement for the given table
+func (db *MyDb) GetTableSchema(name string) (string, error) {
+	rs, err := db.Query(fmt.Sprintf("show create table %s", quoteIdentifier(name)))
 	if err != nil {
-		return
+		return "", fmt.Errorf("show create table %q failed: %w", name, err)
 	}
 	defer rs.Close()
+	var schema string
 	for rs.Next() {
 		var vname string
 		if err := rs.Scan(&vname, &schema); err != nil {
-			panic(fmt.Sprintf("get table %s 's schema failed, %s", name, err))
+			return "", fmt.Errorf("get table %q schema scan failed: %w", name, err)
 		}
 	}
-	return
+	if err := rs.Err(); err != nil {
+		return "", fmt.Errorf("iterate table %q schema: %w", name, err)
+	}
+	if schema == "" {
+		return "", fmt.Errorf("show create table %q returned no data", name)
+	}
+	return schema, nil
 }
 
 // TableFieldsFromInformationSchema retrieves detailed field information from INFORMATION_SCHEMA.COLUMNS
@@ -372,14 +470,15 @@ func (db *MyDb) TableFieldsFromInformationSchema(tableName string) (map[string]*
 			COLLATION_NAME,
 			COLUMN_TYPE,
 			COLUMN_COMMENT,
-			EXTRA
+			EXTRA,
+			IFNULL(GENERATION_EXPRESSION, '')
 		FROM INFORMATION_SCHEMA.COLUMNS
 		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
 		ORDER BY ORDINAL_POSITION`
 
 	rows, err := db.Query(query, db.dbName, tableName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query INFORMATION_SCHEMA.COLUMNS for table %q: %v", tableName, err)
+		return nil, fmt.Errorf("failed to query INFORMATION_SCHEMA.COLUMNS for table %q: %w", tableName, err)
 	}
 	defer rows.Close()
 
@@ -404,9 +503,10 @@ func (db *MyDb) TableFieldsFromInformationSchema(tableName string) (map[string]*
 			&field.ColumnType,
 			&field.ColumnComment,
 			&field.Extra,
+			&field.GenerationExpression,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("failed to scan field information for table %q: %v", tableName, err)
+			return nil, fmt.Errorf("failed to scan field information for table %q: %w", tableName, err)
 		}
 
 		// Handle nullable fields
@@ -414,15 +514,15 @@ func (db *MyDb) TableFieldsFromInformationSchema(tableName string) (map[string]*
 			field.ColumnDefault = &columnDefault.String
 		}
 		if charMaxLen.Valid {
-			val := int(charMaxLen.Int64)
+			val := charMaxLen.Int64
 			field.CharacterMaximumLength = &val
 		}
 		if numericPrecision.Valid {
-			val := int(numericPrecision.Int64)
+			val := numericPrecision.Int64
 			field.NumericPrecision = &val
 		}
 		if numericScale.Valid {
-			val := int(numericScale.Int64)
+			val := numericScale.Int64
 			field.NumericScale = &val
 		}
 		if charset.Valid {
@@ -436,7 +536,7 @@ func (db *MyDb) TableFieldsFromInformationSchema(tableName string) (map[string]*
 	}
 
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating field information for table %q: %v", tableName, err)
+		return nil, fmt.Errorf("error iterating field information for table %q: %w", tableName, err)
 	}
 
 	if len(fields) == 0 {
@@ -448,18 +548,52 @@ func (db *MyDb) TableFieldsFromInformationSchema(tableName string) (map[string]*
 
 // Query execute sql query
 func (db *MyDb) Query(query string, args ...any) (rows *sql.Rows, err error) {
-	txt := fmt.Sprintf("[%-6s: %s] [Query] Start SQL=%s Args=%s\n",
-		db.dbType,
-		db.dbName,
-		xcolor.GreenString("%s", strings.TrimSpace(query)),
-		xcolor.GreenString("%v", args),
-	)
-	log.Output(2, txt)
+	if debugEnabled {
+		txt := fmt.Sprintf("[%-6s: %s] [Query] Start SQL=%s Args=%s\n",
+			db.dbType,
+			db.dbName,
+			xcolor.GreenString("%s", strings.TrimSpace(query)),
+			xcolor.GreenString("%v", args),
+		)
+		log.Output(2, txt)
+	}
 	start := time.Now()
 	defer func() {
-		cost := time.Since(start)
-		txt = fmt.Sprintf("[%-6s: %s] [Query] End   Cost=%s Err=%s\n", db.dbType, db.dbName, cost.String(), errString(err))
-		log.Output(3, txt)
+		if debugEnabled {
+			cost := time.Since(start)
+			txt := fmt.Sprintf("[%-6s: %s] [Query] End   Cost=%s Err=%s\n", db.dbType, db.dbName, cost.String(), errString(err))
+			log.Output(3, txt)
+		}
 	}()
 	return db.sqlDB.Query(query, args...)
+}
+
+// Exec executes a SQL statement with debug logging and timing
+func (db *MyDb) Exec(query string, args ...any) (result sql.Result, err error) {
+	if debugEnabled {
+		txt := fmt.Sprintf("[%-6s: %s] [Exec]  Start SQL=%s Args=%s\n",
+			db.dbType,
+			db.dbName,
+			xcolor.GreenString("%s", strings.TrimSpace(query)),
+			xcolor.GreenString("%v", args),
+		)
+		log.Output(2, txt)
+	}
+	start := time.Now()
+	defer func() {
+		if debugEnabled {
+			cost := time.Since(start)
+			txt := fmt.Sprintf("[%-6s: %s] [Exec]  End   Cost=%s Err=%s\n", db.dbType, db.dbName, cost.String(), errString(err))
+			log.Output(3, txt)
+		}
+	}()
+	return db.sqlDB.Exec(query, args...)
+}
+
+// Close closes the database connection pool
+func (db *MyDb) Close() error {
+	if db.sqlDB != nil {
+		return db.sqlDB.Close()
+	}
+	return nil
 }

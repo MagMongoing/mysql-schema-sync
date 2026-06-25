@@ -3,6 +3,7 @@ package internal
 import (
 	"bytes"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/xanygo/anygo/ds/xmap"
@@ -19,28 +20,47 @@ type MySchema struct {
 
 func (mys *MySchema) String() string {
 	if mys.Fields.Len() == 0 {
-		return "nil"
+		return "<empty schema>"
 	}
 	var buf bytes.Buffer
 	buf.WriteString("Fields:\n")
-	for name, v := range mys.Fields.Keys() {
+	for name, v := range mys.Fields.Iter() {
 		buf.WriteString(fmt.Sprintf(" %v : %s\n", name, v))
 	}
 
 	if len(mys.FieldInfos) > 0 {
 		buf.WriteString("FieldInfos:\n")
-		for name, info := range mys.FieldInfos {
+		fiNames := make([]string, 0, len(mys.FieldInfos))
+		for name := range mys.FieldInfos {
+			fiNames = append(fiNames, name)
+		}
+		sort.Strings(fiNames)
+		for _, name := range fiNames {
+			info := mys.FieldInfos[name]
 			buf.WriteString(fmt.Sprintf(" %s : %s (charset: %v, collation: %v)\n",
 				name, info.String(), info.CharsetName, info.CollationName))
 		}
 	}
 
 	buf.WriteString("Index:\n")
-	for name, idx := range mys.IndexAll {
+	idxNames := make([]string, 0, len(mys.IndexAll))
+	for name := range mys.IndexAll {
+		idxNames = append(idxNames, name)
+	}
+	sort.Strings(idxNames)
+	for _, name := range idxNames {
+		idx := mys.IndexAll[name]
 		buf.WriteString(fmt.Sprintf(" %s : %s\n", name, idx.SQL))
 	}
+
 	buf.WriteString("ForeignKey:\n")
-	for name, idx := range mys.ForeignAll {
+	fkNames := make([]string, 0, len(mys.ForeignAll))
+	for name := range mys.ForeignAll {
+		fkNames = append(fkNames, name)
+	}
+	sort.Strings(fkNames)
+	for _, name := range fkNames {
+		idx := mys.ForeignAll[name]
 		buf.WriteString(fmt.Sprintf("  %s : %s\n", name, idx.SQL))
 	}
 	return buf.String()
@@ -58,11 +78,36 @@ func (mys *MySchema) RelationTables() []string {
 			tbs[tb] = 1
 		}
 	}
-	var tables []string
+	tables := make([]string, 0, len(tbs))
 	for tb := range tbs {
 		tables = append(tables, tb)
 	}
+	sort.Strings(tables)
 	return tables
+}
+
+// extractQuotedIdentifier extracts an identifier from a line that starts with the
+// given quote character. Handles doubled quotes (e.g., `` `col``name` `` → "col`name").
+// Returns the identifier without quotes, or "" if the line is malformed.
+func extractQuotedIdentifier(line string, quote byte) string {
+	// line starts with the quote character; skip it
+	var name []byte
+	i := 1
+	for i < len(line) {
+		if line[i] == quote {
+			if i+1 < len(line) && line[i+1] == quote {
+				// Doubled quote → literal quote character in the identifier
+				name = append(name, quote)
+				i += 2
+				continue
+			}
+			// Single quote → end of identifier
+			return string(name)
+		}
+		name = append(name, line[i])
+		i++
+	}
+	return "" // no closing quote found
 }
 
 // ParseSchema parse table's schema
@@ -85,13 +130,17 @@ func ParseSchema(schema string) *MySchema {
 		line = strings.TrimRight(line, ",")
 		switch line[0] {
 		case '`':
-			index := strings.Index(line[1:], "`")
-			name := line[1 : index+1]
+			name := extractQuotedIdentifier(line, '`')
+			if name == "" {
+				continue // malformed line: no closing backtick
+			}
 			mys.Fields.Set(name, line)
 
 		case '"':
-			index := strings.Index(line[1:], "\"")
-			name := line[1 : index+1]
+			name := extractQuotedIdentifier(line, '"')
+			if name == "" {
+				continue // malformed line: no closing double quote
+			}
 			mys.Fields.Set(name, line)
 
 		default:

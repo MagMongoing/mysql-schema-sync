@@ -2,6 +2,8 @@ package internal
 
 import (
 	"encoding/json"
+	"fmt"
+	"html"
 	"log"
 	"os"
 	"strings"
@@ -30,16 +32,16 @@ type Config struct {
 	TablesIgnore []string `json:"tables_ignore"`
 
 	// Sync 是否真正的执行同步操作
-	Sync bool
+	Sync bool `json:"-"`
 
 	// Drop 若目标数据库表比源头多了字段、索引，是否删除
-	Drop bool
+	Drop bool `json:"-"`
 
 	// FieldOrder 是否同步字段顺序（需要重建表，可能影响性能）
-	FieldOrder bool
+	FieldOrder bool `json:"-"`
 
 	// HTTPAddress 生成站点报告的地址，如 :8080
-	HTTPAddress string
+	HTTPAddress string `json:"-"`
 
 	// SingleSchemaChange 生成sql ddl语言每条命令只会进行单个修改操作
 	SingleSchemaChange bool `json:"single_schema_change"`
@@ -49,8 +51,35 @@ type Config struct {
 }
 
 func (cfg *Config) String() string {
-	ds, _ := json.MarshalIndent(cfg, "  ", "  ")
+	// Mask passwords to avoid credential leakage in logs
+	masked := *cfg
+	masked.SourceDSN = maskDSNPassword(masked.SourceDSN)
+	masked.DestDSN = maskDSNPassword(masked.DestDSN)
+	if masked.Email != nil {
+		emailCopy := *masked.Email
+		emailCopy.Password = "***"
+		masked.Email = &emailCopy
+	}
+	ds, _ := json.MarshalIndent(&masked, "  ", "  ")
 	return string(ds)
+}
+
+// maskDSNPassword replaces the password portion of a MySQL DSN with ***
+// DSN format: user:password@tcp(host:port)/dbname
+// Note: Uses LastIndex because go-sql-driver parses from the last '@',
+// allowing passwords to contain '@' characters.
+func maskDSNPassword(dsn string) string {
+	atIdx := strings.LastIndex(dsn, "@")
+	if atIdx < 0 {
+		return dsn
+	}
+	userPart := dsn[:atIdx]
+	rest := dsn[atIdx:]
+	colonIdx := strings.Index(userPart, ":")
+	if colonIdx < 0 {
+		return dsn // no password
+	}
+	return userPart[:colonIdx] + ":***" + rest
 }
 
 // AlterIgnoreTable table's ignore info
@@ -115,21 +144,22 @@ func (cfg *Config) CheckMatchIgnoreTables(name string) bool {
 		return false
 	}
 	for _, tableName := range cfg.TablesIgnore {
-		if simpleMatch(tableName, name, "CheckMatchTables") {
+		if simpleMatch(tableName, name, "CheckMatchIgnoreTables") {
 			return true
 		}
 	}
 	return false
 }
 
-// Check check config
-func (cfg *Config) Check() {
+// Check validates the config and returns an error if invalid
+func (cfg *Config) Check() error {
 	if len(cfg.SourceDSN) == 0 {
-		log.Fatal("source DSN is empty")
+		return fmt.Errorf("source DSN is empty")
 	}
 	if len(cfg.DestDSN) == 0 {
-		log.Fatal("dest DSN is empty")
+		return fmt.Errorf("dest DSN is empty")
 	}
+	return nil
 }
 
 // IsIgnoreIndex is index ignore
@@ -137,7 +167,7 @@ func (cfg *Config) IsIgnoreIndex(table string, name string) bool {
 	for tableName, dit := range cfg.AlterIgnore {
 		if simpleMatch(tableName, table, "IsIgnoreIndex_table") {
 			for _, index := range dit.Index {
-				if simpleMatch(index, name) {
+				if simpleMatch(index, name, "IsIgnoreIndex_name") {
 					return true
 				}
 			}
@@ -151,7 +181,7 @@ func (cfg *Config) IsIgnoreForeignKey(table string, name string) bool {
 	for tableName, dit := range cfg.AlterIgnore {
 		if simpleMatch(tableName, table, "IsIgnoreForeignKey_table") {
 			for _, foreignName := range dit.ForeignKey {
-				if simpleMatch(foreignName, name) {
+				if simpleMatch(foreignName, name, "IsIgnoreForeignKey_name") {
 					return true
 				}
 			}
@@ -167,23 +197,29 @@ func (cfg *Config) SendMailFail(errStr string) {
 		return
 	}
 	_host, _ := os.Hostname()
+	if _host == "" {
+		_host = "unknown"
+	}
 	title := "[mysql-schema-sync][" + _host + "]failed"
-	body := "error:<font color=red>" + errStr + "</font><br/>"
-	body += "host:" + _host + "<br/>"
-	body += "config-file:" + cfg.ConfigPath + "<br/>"
-	body += "dest_dsn:" + cfg.DestDSN + "<br/>"
+	body := "error:<font color=red>" + html.EscapeString(errStr) + "</font><br/>"
+	body += "host:" + html.EscapeString(_host) + "<br/>"
+	body += "config-file:" + html.EscapeString(cfg.ConfigPath) + "<br/>"
+	body += "dest_dsn:" + html.EscapeString(maskDSNPassword(cfg.DestDSN)) + "<br/>"
 	pwd, _ := os.Getwd()
-	body += "pwd:" + pwd + "<br/>"
+	body += "pwd:" + html.EscapeString(pwd) + "<br/>"
 	cfg.Email.SendMail(title, body)
 }
 
 // LoadConfig load config file
-func LoadConfig(confPath string) *Config {
+func LoadConfig(confPath string) (*Config, error) {
 	var cfg *Config
 	err := loadJSONFile(confPath, &cfg)
 	if err != nil {
-		log.Fatalln("load json conf:", confPath, "failed:", err)
+		return nil, fmt.Errorf("load json conf %q: %w", confPath, err)
+	}
+	if cfg == nil {
+		return nil, fmt.Errorf("config file %q contains null or invalid JSON", confPath)
 	}
 	cfg.ConfigPath = confPath
-	return cfg
+	return cfg, nil
 }

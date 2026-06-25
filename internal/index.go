@@ -24,7 +24,7 @@ const (
 	indexTypePrimary    indexType = "PRIMARY"
 	indexTypeIndex      indexType = "INDEX"
 	indexTypeForeignKey indexType = "FOREIGN KEY"
-	checkConstraint     indexType = "CHECK"
+	indexTypeCheck indexType = "CHECK"
 )
 
 func (idx *DbIndex) alterAddSQL(drop bool) []string {
@@ -41,16 +41,20 @@ func (idx *DbIndex) alterAddSQL(drop bool) []string {
 		alterSQL = append(alterSQL, "ADD "+idx.SQL)
 	case indexTypeIndex, indexTypeForeignKey:
 		alterSQL = append(alterSQL, fmt.Sprintf("ADD %s", idx.SQL))
-	case checkConstraint:
+	case indexTypeCheck:
 		alterSQL = append(alterSQL, fmt.Sprintf("ADD %s", idx.SQL))
 	default:
-		log.Fatalln("unknown indexType", idx.IndexType)
+		log.Printf("[WARN] unknown indexType in alterAddSQL: %s", idx.IndexType)
 	}
 	return alterSQL
 }
 
 func (idx *DbIndex) String() string {
-	bs, _ := json.MarshalIndent(idx, "  ", " ")
+	bs, err := json.MarshalIndent(idx, "  ", " ")
+	if err != nil {
+		log.Printf("[WARN] DbIndex.String() marshal failed: %v", err)
+		return fmt.Sprintf("{Name:%q, Type:%s, SQL:%q}", idx.Name, idx.IndexType, idx.SQL)
+	}
 	return string(bs)
 }
 
@@ -59,13 +63,13 @@ func (idx *DbIndex) alterDropSQL() string {
 	case indexTypePrimary:
 		return "DROP PRIMARY KEY"
 	case indexTypeIndex:
-		return fmt.Sprintf("DROP INDEX `%s`", idx.Name)
+		return fmt.Sprintf("DROP INDEX %s", quoteIdentifier(idx.Name))
 	case indexTypeForeignKey:
-		return fmt.Sprintf("DROP FOREIGN KEY `%s`", idx.Name)
-	case checkConstraint:
-		return fmt.Sprintf("DROP CHECK `%s`", idx.Name)
+		return fmt.Sprintf("DROP FOREIGN KEY %s", quoteIdentifier(idx.Name))
+	case indexTypeCheck:
+		return fmt.Sprintf("DROP CHECK %s", quoteIdentifier(idx.Name))
 	default:
-		log.Fatalln("unknown indexType", idx.IndexType)
+		log.Printf("[WARN] unknown indexType in alterDropSQL: %s", idx.IndexType)
 	}
 	return ""
 }
@@ -78,13 +82,13 @@ func (idx *DbIndex) addRelationTable(table string) {
 }
 
 // 匹配索引字段
-var indexReg = regexp.MustCompile(`^([A-Z]+\s)?KEY\s`)
+var indexReg = regexp.MustCompile(`^([A-Z]+\s)?KEY\s+` + "`")
 
 // 匹配外键
-var foreignKeyReg = regexp.MustCompile("^CONSTRAINT `(.+)` FOREIGN KEY.+ REFERENCES `(.+)` ")
+var foreignKeyReg = regexp.MustCompile("^CONSTRAINT `([^`]+)` FOREIGN KEY.+ REFERENCES `([^`]+)` ")
 
 // Check约束
-var checkConstraintReg = regexp.MustCompile("^CONSTRAINT `([^`]+)` CHECK \\(\\((.+)\\)\\)")
+var checkConstraintReg = regexp.MustCompile("^CONSTRAINT `([^`]+)` CHECK \\(\\(?(.+?)\\)?\\)")
 
 func parseDbIndexLine(line string) *DbIndex {
 	line = strings.TrimSpace(line)
@@ -103,9 +107,14 @@ func parseDbIndexLine(line string) *DbIndex {
 	// PRIMARY KEY (`d`)
 	// KEY `idx_e` (`e`),
 	if indexReg.MatchString(line) {
-		arr := strings.Split(line, "`")
+		// Use extractQuotedIdentifier to handle doubled backticks in index names
 		idx.IndexType = indexTypeIndex
-		idx.Name = arr[1]
+		name := extractQuotedIdentifier(line[strings.IndexByte(line, '`'):], '`')
+		if name == "" {
+			log.Printf("[WARN] db_index parse skipped: KEY line without backticks: %s", line)
+			return nil
+		}
+		idx.Name = name
 		return idx
 	}
 
@@ -121,11 +130,11 @@ func parseDbIndexLine(line string) *DbIndex {
 	// CONSTRAINT `chk_xx_1` CHECK ((`x` >= 0 and `y` <= 100))
 	checkMatches := checkConstraintReg.FindStringSubmatch(line)
 	if len(checkMatches) > 0 {
-		idx.IndexType = checkConstraint
+		idx.IndexType = indexTypeCheck
 		idx.Name = checkMatches[1]
 		return idx
 	}
 
-	log.Fatalln("db_index parse failed, unsupported, line:", line)
+	log.Printf("[WARN] db_index parse skipped, unsupported line: %s", line)
 	return nil
 }

@@ -73,8 +73,9 @@ func (ta *TableAlterData) String() string {
 	return strings.TrimSpace(str)
 }
 
-var autoIncrReg = regexp.MustCompile(`\sAUTO_INCREMENT=[1-9]\d*\s`)
+var autoIncrReg = regexp.MustCompile(`\sAUTO_INCREMENT=[1-9]\d*(\s|$)`)
 
 func fmtTableCreateSQL(sql string) string {
-	return autoIncrReg.ReplaceAllString(sql, " ")
+	result := autoIncrReg.ReplaceAllString(sql, " ")
+	return strings.TrimRight(result, " ")
 }

@@ -7,6 +7,7 @@ package internal
 import (
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 
 	"github.com/xanygo/anygo/cli/xcolor"
@@ -19,8 +20,26 @@ func Execute(cfg *Config) {
 		scs.sendMailNotice(cfg)
 	}()
 
-	sc := NewSchemaSync(cfg)
-	allTables := sc.AllDBTables()
+	sc, err := NewSchemaSync(cfg)
+	if err != nil {
+		log.Printf("[FATAL] failed to initialize schema sync: %s", err)
+		scs.fatalErr = err
+		return // let deferred sendMailNotice and timer.run
+	}
+	defer func() {
+		if sc.SourceDb != nil {
+			sc.SourceDb.Close()
+		}
+		if sc.DestDb != nil {
+			sc.DestDb.Close()
+		}
+	}()
+	allTables, err := sc.AllDBTables()
+	if err != nil {
+		log.Printf("[FATAL] failed to list tables: %s", err)
+		scs.fatalErr = err
+		return // let deferred sendMailNotice and db close run
+	}
 	// log.Println("source db table total:", len(allTables))
 
 	changedTables := make(map[string][]*TableAlterData)
@@ -37,7 +56,11 @@ func Execute(cfg *Config) {
 			continue
 		}
 
-		sd := sc.getAlterDataByTable(table, cfg)
+		sd, err := sc.getAlterDataByTable(table, cfg)
+		if err != nil {
+			log.Printf("[ERROR] skip table %q: %s", table, err)
+			continue
+		}
 
 		switch sd.Type {
 		case alterTypeNo:
@@ -67,49 +90,53 @@ func Execute(cfg *Config) {
 
 	var countSuccess int
 	var countFailed int
-	canRunTypePref := "single"
-
-	// 先执行单个表的
-runSync:
-	for typeName, sds := range changedTables {
-		if !strings.HasPrefix(typeName, canRunTypePref) {
-			continue
-		}
-		log.Println("runSyncType:", typeName)
-		var sqls []string
-		var sts []*tableStatics
-		for _, sd := range sds {
-			for index := range sd.SQL {
-				sql := strings.TrimRight(sd.SQL[index], ";")
-				sqls = append(sqls, sql)
-
-				st := scs.newTableStatics(sd.Table, sd, index)
-				sts = append(sts, st)
+	// 先执行单个表的，再执行多表关联的
+	for _, canRunTypePref := range []string{"single", "multi"} {
+		// Sort group keys for deterministic execution order within each prefix
+		groupKeys := make([]string, 0, len(changedTables))
+		for typeName := range changedTables {
+			if strings.HasPrefix(typeName, canRunTypePref) {
+				groupKeys = append(groupKeys, typeName)
 			}
 		}
+		sort.Strings(groupKeys)
 
-		sql := strings.Join(sqls, ";\n") + ";"
-		var ret error
+		for _, typeName := range groupKeys {
+			sds := changedTables[typeName]
+			log.Println("runSyncType:", typeName)
+			var sqls []string
+			var sts []*tableStatics
+			for _, sd := range sds {
+				for index := range sd.SQL {
+					sql := strings.TrimRight(sd.SQL[index], ";")
+					sqls = append(sqls, sql)
 
-		if sc.Config.Sync {
-			ret = sc.SyncSQL4Dest(sql, sqls)
-			if ret == nil {
-				countSuccess++
-			} else {
-				countFailed++
+					st := scs.newTableStatics(sd.Table, sd, index)
+					sts = append(sts, st)
+				}
+			}
+
+			sql := strings.Join(sqls, ";\n") + ";"
+			var ret error
+
+			if sc.Config.Sync {
+				ret = sc.SyncSQL4Dest(sql, sqls)
+				tableCount := len(sds)
+				if ret == nil {
+					countSuccess += tableCount
+				} else {
+					countFailed += tableCount
+				}
+			}
+			for _, st := range sts {
+				st.alterRet = ret
+				st.schemaAfter, err = sc.DestDb.GetTableSchema(st.table)
+				if err != nil {
+					log.Printf("[WARN] get schema after sync for %q failed: %s", st.table, err)
+				}
+				st.timer.stop()
 			}
 		}
-		for _, st := range sts {
-			st.alterRet = ret
-			st.schemaAfter = sc.DestDb.GetTableSchema(st.table)
-			st.timer.stop()
-		}
-	} // end for
-
-	// 最后再执行多个表的 alter
-	if canRunTypePref == "single" {
-		canRunTypePref = "multi"
-		goto runSync
 	}
 
 	if sc.Config.Sync {

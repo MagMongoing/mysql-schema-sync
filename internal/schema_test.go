@@ -37,12 +37,11 @@ func TestParseSchema(t *testing.T) {
 			want: &MySchema{
 				Fields: (func() xmap.Ordered[string, string] {
 					m := xmap.Ordered[string, string]{}
-					// 不会检查 value
-					m.Set("id", "`id` bigint unsigned NOT NULL AUTO_INCREMENT,")
-					m.Set("email", "`email` varchar(1000) NOT NULL DEFAULT '',")
-					m.Set("register_time", "`register_time` timestamp NOT NULL,")
-					m.Set("password", "`password` varchar(1000) NOT NULL DEFAULT '',")
-					m.Set("status", "`status` tinyint unsigned NOT NULL DEFAULT '0',")
+					m.Set("id", "`id` bigint unsigned NOT NULL AUTO_INCREMENT")
+					m.Set("email", "`email` varchar(1000) NOT NULL DEFAULT ''")
+					m.Set("register_time", "`register_time` timestamp NOT NULL")
+					m.Set("password", "`password` varchar(1000) NOT NULL DEFAULT ''")
+					m.Set("status", "`status` tinyint unsigned NOT NULL DEFAULT '0'")
 					return m
 				})(),
 				IndexAll: map[string]*DbIndex{
@@ -62,12 +61,11 @@ func TestParseSchema(t *testing.T) {
 			want: &MySchema{
 				Fields: (func() xmap.Ordered[string, string] {
 					m := xmap.Ordered[string, string]{}
-					// 不会检查 value
-					m.Set("id", "\"id\" bigint unsigned NOT NULL AUTO_INCREMENT,")
-					m.Set("email", "\"email\" varchar(1000) NOT NULL DEFAULT \"\",")
-					m.Set("register_time", "\"register_time\" timestamp NOT NULL,")
-					m.Set("password", "\"password\" varchar(1000) NOT NULL DEFAULT \"\",")
-					m.Set("status", "\"status\" tinyint unsigned NOT NULL DEFAULT \"0\",")
+					m.Set("id", "\"id\" bigint unsigned NOT NULL AUTO_INCREMENT")
+					m.Set("email", "\"email\" varchar(1000) NOT NULL DEFAULT \"\"")
+					m.Set("register_time", "\"register_time\" timestamp NOT NULL")
+					m.Set("password", "\"password\" varchar(1000) NOT NULL DEFAULT \"\"")
+					m.Set("status", "\"status\" tinyint unsigned NOT NULL DEFAULT \"0\"")
 					return m
 				})(),
 				IndexAll: map[string]*DbIndex{
@@ -86,6 +84,31 @@ func TestParseSchema(t *testing.T) {
 			gs := got.String()
 			ws := tt.want.String()
 			xt.Equal(t, ws, gs)
+		})
+	}
+}
+
+func TestExtractQuotedIdentifier(t *testing.T) {
+	tests := []struct {
+		name  string
+		line  string
+		quote byte
+		want  string
+	}{
+		{"simple backtick", "`name` varchar(255)", '`', "name"},
+		{"doubled backtick", "`col``name` int NOT NULL", '`', "col`name"},
+		{"multiple doubled", "`a``b``c` text", '`', "a`b`c"},
+		{"no closing quote", "`unclosed", '`', ""},
+		{"double quote simple", "\"id\" bigint", '"', "id"},
+		{"double quote doubled", "\"col\"\"name\" text", '"', "col\"name"},
+		{"empty identifier", "`` int", '`', ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractQuotedIdentifier(tt.line, tt.quote)
+			if got != tt.want {
+				t.Errorf("extractQuotedIdentifier(%q, %q) = %q, want %q", tt.line, tt.quote, got, tt.want)
+			}
 		})
 	}
 }

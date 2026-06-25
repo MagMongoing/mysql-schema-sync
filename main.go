@@ -12,7 +12,7 @@ import (
 )
 
 var configPath = flag.String("conf", "./mydb_conf.json", "json config file path")
-var sync = flag.Bool("sync", false, "sync schema changes to dest's db\non default, only show difference")
+var doSync = flag.Bool("sync", false, "sync schema changes to dest's db\non default, only show difference")
 var drop = flag.Bool("drop", false, "drop fields,index,foreign key only on dest's table")
 var fieldOrder = flag.Bool("field-order", false, "sync field order (may require table rebuild, affecting performance)")
 var httpAddress = flag.String("http", "", "HTTP service address, eg. :8080")
@@ -23,6 +23,7 @@ var tables = flag.String("tables", "", "tables to sync\neg : product_base,order_
 var tablesIgnore = flag.String("tables_ignore", "", "tables ignore sync\neg : product_base,order_*")
 var mailTo = flag.String("mail_to", "", "overwrite config's email.to")
 var singleSchemaChange = flag.Bool("single_schema_change", false, "single schema changes ddl command a single schema change")
+var debug = flag.Bool("debug", false, "enable verbose debug logging")
 
 func init() {
 	log.SetFlags(log.Lshortfile | log.Ldate)
@@ -35,25 +36,36 @@ func init() {
 	}
 }
 
-var cfg *internal.Config
-
 func main() {
 	flag.Parse()
+	internal.SetDebug(*debug)
+	var cfg *internal.Config
 	if len(*source) == 0 {
-		cfg = internal.LoadConfig(*configPath)
+		var err error
+		cfg, err = internal.LoadConfig(*configPath)
+		if err != nil {
+			log.Fatalf("config error: %s", err)
+		}
 	} else {
 		cfg = new(internal.Config)
 		cfg.SourceDSN = *source
 		cfg.DestDSN = *dest
+		if len(*dest) == 0 {
+			log.Fatal("error: -source was specified but -dest is empty. Please provide a destination DSN.")
+		}
 	}
-	cfg.Sync = *sync
+	cfg.Sync = *doSync
 	cfg.Drop = *drop
 	cfg.FieldOrder = *fieldOrder
 	cfg.HTTPAddress = *httpAddress
 	cfg.SingleSchemaChange = *singleSchemaChange
 
-	if len(*mailTo) != 0 && cfg.Email != nil {
-		cfg.Email.To = *mailTo
+	if len(*mailTo) != 0 {
+		if cfg.Email != nil {
+			cfg.Email.To = *mailTo
+		} else {
+			log.Println("[WARN] -mail_to specified but no email configuration in config file; ignored")
+		}
 	}
 	cfg.SetTables(strings.Split(*tables, ","))
 	cfg.SetTablesIgnore(strings.Split(*tablesIgnore, ","))
@@ -68,6 +80,8 @@ func main() {
 		}
 	})()
 
-	cfg.Check()
+	if err := cfg.Check(); err != nil {
+		log.Fatalf("config error: %s", err)
+	}
 	internal.Execute(cfg)
 }

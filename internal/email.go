@@ -67,7 +67,11 @@ func (m *EmailStruct) SendMail(title string, body string) {
 	}
 
 	body = mailBody(body)
-	portInt, _ := strconv.Atoi(port)
+	portInt, err := strconv.Atoi(port)
+	if err != nil {
+		log.Printf("invalid SMTP port %q: %s", port, err)
+		return
+	}
 
 	cfg := &xsmtp.Config{
 		Host:     host,
@@ -88,7 +92,12 @@ func (m *EmailStruct) SendMail(title string, body string) {
 	if err == nil {
 		log.Println("send mail success")
 	} else {
-		log.Println("send mail failed, err:", err)
+		// Sanitize error to avoid leaking SMTP credentials in logs
+		errMsg := err.Error()
+		if len(m.Password) > 0 {
+			errMsg = strings.ReplaceAll(errMsg, m.Password, "***")
+		}
+		log.Println("send mail failed, err:", errMsg)
 	}
 }
 

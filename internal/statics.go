@@ -1,21 +1,27 @@
 package internal
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"html"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 )
 
 type statics struct {
-	timer  *myTimer
-	Config *Config
-	tables []*tableStatics
+	timer    *myTimer
+	Config   *Config
+	tables   []*tableStatics
+	fatalErr error // set when a fatal error prevents any table processing
 }
 
 type tableStatics struct {
@@ -49,10 +55,22 @@ func (s *statics) newTableStatics(table string, sd *TableAlterData, index int) *
 		*nts = *ts
 		nts.alter = sds[index]
 		s.tables = append(s.tables, nts)
-	} else {
-		s.tables = append(s.tables, ts)
+		return nts // return the one stored in report, so caller can set alterRet/schemaAfter on it
 	}
+	s.tables = append(s.tables, ts)
 	return ts
+}
+
+// sanitizeAnchorID replaces non-alphanumeric characters with underscores so the
+// result is safe for use in both HTML href fragments and <a name> attributes,
+// ensuring consistent anchor navigation regardless of browser entity decoding.
+func sanitizeAnchorID(s string) string {
+	return strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+			return r
+		}
+		return '_'
+	}, s)
 }
 
 func (s *statics) toHTML() string {
@@ -71,13 +89,15 @@ func (s *statics) toHTML() string {
 	for idx, tb := range s.tables {
 		code += "<tr>"
 		code += "<td>" + strconv.Itoa(idx+1) + "</td>\n"
-		code += "<td><a href='#detail_" + tb.table + "'>" + tb.table + "</a></td>\n"
+		escapedTable := html.EscapeString(tb.table)
+		anchorID := sanitizeAnchorID(tb.table)
+		code += "<td><a href='#detail_" + anchorID + "'>" + escapedTable + "</a></td>\n"
 		code += "<td>"
 		if s.Config.Sync {
 			if tb.alterRet == nil {
-				code += "<font color=green>成功</font>"
+				code += "<span style=\"color:green\">成功</span>"
 			} else {
-				code += "<font color=red>失败：" + html.EscapeString(tb.alterRet.Error()) + "</font>"
+				code += "<span style=\"color:red\">失败：" + html.EscapeString(tb.alterRet.Error()) + "</span>"
 			}
 		} else {
 			code += "未同步"
@@ -88,7 +108,7 @@ func (s *statics) toHTML() string {
 	}
 	code += "</tbody></table>\n<h3>SQLs</h3>\n<pre>"
 	for _, tb := range s.tables {
-		code += "<a name='detail_" + tb.table + "'></a>"
+		code += "<a name='detail_" + sanitizeAnchorID(tb.table) + "'></a>"
 		code += html.EscapeString(tb.alter.String()) + "\n\n"
 	}
 	code += "</pre>\n\n"
@@ -107,12 +127,12 @@ func (s *statics) toHTML() string {
 	for idx, tb := range s.tables {
 		code += "<tr>"
 		code += "<th rowspan=2>" + strconv.Itoa(idx+1) + "</th>\n"
-		code += "<td rowspan=2>" + tb.table + "<br/><br/>"
+		code += "<td rowspan=2>" + html.EscapeString(tb.table) + "<br/><br/>"
 		if s.Config.Sync {
 			if tb.alterRet == nil {
-				code += "<font color=green>成功</font>"
+				code += "<span style=\"color:green\">成功</span>"
 			} else {
-				code += "<font color=red>失败：" + tb.alterRet.Error() + "</font>"
+				code += "<span style=\"color:red\">失败：" + html.EscapeString(tb.alterRet.Error()) + "</span>"
 			}
 		} else {
 			code += "未同步"
@@ -120,7 +140,7 @@ func (s *statics) toHTML() string {
 		code += "</td>\n"
 		code += "<td valign=top><b>数据源 Schema:</b><br/>"
 		if len(tb.alter.SchemaDiff.Source.SchemaRaw) == 0 {
-			code += "<font color=red>在源数据源不存在，在目标数据库存在</font>"
+			code += "<span style=\"color:red\">在源数据源不存在，在目标数据库存在</span>"
 		} else {
 			code += htmlPre(tb.alter.SchemaDiff.Source.SchemaRaw)
 		}
@@ -163,6 +183,15 @@ func (s *statics) alterFailedNum() int {
 func (s *statics) sendMailNotice(cfg *Config) {
 	alterTotal := len(s.tables)
 	if alterTotal < 1 {
+		if s.fatalErr != nil {
+			errMsg := fmt.Sprintf("fatal error: %s", s.fatalErr)
+			writeHTMLResult(errMsg)
+			log.Println("fatal error, skip send mail:", s.fatalErr)
+			if cfg.Email != nil {
+				cfg.SendMailFail(errMsg)
+			}
+			return
+		}
 		writeHTMLResult("no table change")
 		log.Println("no table change, skip send mail")
 		return
@@ -176,24 +205,27 @@ func (s *statics) sendMailNotice(cfg *Config) {
 
 	if !s.Config.Sync {
 		title += "[preview]"
-		body += "<font color=red>所有 SQL 均未执行!</font>\n"
+		body += "<span style=\"color:red\">所有 SQL 均未执行!</span>\n"
 	}
 
 	hostName, _ := os.Hostname()
+	if hostName == "" {
+		hostName = "unknown"
+	}
 	body += "<h2>任务信息</h2>\n<pre>"
 	body += " 数据源：" + dsnShort(cfg.SourceDSN) + "\n"
 	body += "   目标：" + dsnShort(cfg.DestDSN) + "\n"
 	body += " 有变化：" + strconv.Itoa(len(s.tables)) + " 张表/条语句\n"
-	body += "<font color=green>是否同步：" + fmt.Sprintf("%t", s.Config.Sync) + "</font>\n"
+	body += "<span style=\"color:green\">是否同步：" + fmt.Sprintf("%t", s.Config.Sync) + "</span>\n"
 	if s.Config.Sync {
 		fn := s.alterFailedNum()
-		body += "<font color=red>失败数 : " + strconv.Itoa(fn) + "</font>\n"
+		body += "<span style=\"color:red\">失败数 : " + strconv.Itoa(fn) + "</span>\n"
 		if fn > 0 {
 			title += " [失败-" + strconv.Itoa(fn) + "]"
 		}
 	}
 	body += "\n"
-	body += "  主机名： " + hostName + "\n"
+	body += "  主机名： " + html.EscapeString(hostName) + "\n"
 	body += "开始时间： " + s.timer.start.Format(timeFormatStd) + "\n"
 	body += "截止时间： " + s.timer.end.Format(timeFormatStd) + "\n"
 	body += "运行耗时： " + s.timer.usedSecond() + "\n"
@@ -212,20 +244,58 @@ func (s *statics) sendMailNotice(cfg *Config) {
 
 func startWebServer(addr string) {
 	fp := filepath.Join(os.TempDir(), "mysql-schema-sync_last.html")
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	if len(htmlResultPath) > 0 {
+		fp = htmlResultPath
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("[HTTP] %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
 		bf, err := os.ReadFile(fp)
 		if err != nil {
 			http.NotFoundHandler().ServeHTTP(w, r)
 			return
 		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
 		_, _ = w.Write(bf)
 	})
-	log.Printf("http://%s", addr)
+	log.Printf("[WARN] HTTP report server starting on %s — no authentication configured, schema details may be exposed", addr)
 	log.Println("Press Ctrl-C to terminate the program")
 	ser := &http.Server{
-		Addr: addr,
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
-	log.Println(ser.ListenAndServe())
+
+	// Graceful shutdown on SIGINT/SIGTERM
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		defer signal.Stop(sigCh)
+		sig := <-sigCh
+		log.Printf("[HTTP] received signal %s, shutting down...", sig)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := ser.Shutdown(ctx); err != nil {
+			log.Printf("[HTTP] shutdown error: %s", err)
+		}
+	}()
+
+	if err := ser.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Printf("[HTTP] server error: %s", err)
+	}
 }
 
 func writeHTMLResult(str string) {
@@ -233,7 +303,7 @@ func writeHTMLResult(str string) {
 	if len(htmlResultPath) > 0 {
 		fp = htmlResultPath
 	}
-	err := os.WriteFile(fp, []byte(str), 0666)
+	err := os.WriteFile(fp, []byte(str), 0600)
 	log.Println("html result:", fp, err)
 }
 

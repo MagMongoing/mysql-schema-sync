@@ -1,6 +1,8 @@
 package internal
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -138,6 +140,147 @@ func TestNormalizeIntegerType(t *testing.T) {
 			result := normalizeIntegerType(tt.input)
 			if result != tt.expected {
 				t.Errorf("normalizeIntegerType(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestSimpleMatch(t *testing.T) {
+	tests := []struct {
+		name    string
+		pattern string
+		str     string
+		want    bool
+	}{
+		{"exact match", "users", "users", true},
+		{"no match", "users", "orders", false},
+		{"wildcard suffix", "order_*", "order_items", true},
+		{"wildcard suffix no match", "order_*", "user_items", false},
+		{"wildcard prefix", "*_log", "access_log", true},
+		{"wildcard both", "*order*", "my_order_table", true},
+		{"star matches all", "*", "anything", true},
+		{"empty pattern", "", "", true},
+		{"empty pattern vs non-empty", "", "x", false},
+		{"spaces trimmed", " users ", "users", true},
+		{"multiple wildcards", "t_*_*_log", "t_access_2024_log", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := simpleMatch(tt.pattern, tt.str)
+			if got != tt.want {
+				t.Errorf("simpleMatch(%q, %q) = %v, want %v", tt.pattern, tt.str, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDsnShort(t *testing.T) {
+	tests := []struct {
+		name string
+		dsn  string
+		want string
+	}{
+		{"normal DSN", "user:pass@tcp(127.0.0.1:3306)/db", "tcp(127.0.0.1:3306)/db"},
+		{"empty DSN", "", ""},
+		{"no @ sign", "invalid-dsn", "<invalid DSN>"},
+		{"@ at start", "@tcp(host)/db", "<invalid DSN>"},
+		{"multiple @", "user@host@extra", "extra"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := dsnShort(tt.dsn)
+			if got != tt.want {
+				t.Errorf("dsnShort(%q) = %q, want %q", tt.dsn, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoadJSONFile(t *testing.T) {
+	t.Run("valid JSON with comments", func(t *testing.T) {
+		dir := t.TempDir()
+		fp := filepath.Join(dir, "test.json")
+		content := `# This is a comment
+// Another comment
+{
+  "name": "test",
+  "value": 42
+}`
+		if err := os.WriteFile(fp, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+		var result struct {
+			Name  string `json:"name"`
+			Value int    `json:"value"`
+		}
+		if err := loadJSONFile(fp, &result); err != nil {
+			t.Fatalf("loadJSONFile() error = %v", err)
+		}
+		if result.Name != "test" || result.Value != 42 {
+			t.Errorf("loadJSONFile() got %+v, want {Name:test Value:42}", result)
+		}
+	})
+
+	t.Run("file not found", func(t *testing.T) {
+		err := loadJSONFile("/nonexistent/path.json", &struct{}{})
+		if err == nil {
+			t.Error("loadJSONFile() expected error for missing file")
+		}
+	})
+
+	t.Run("invalid JSON", func(t *testing.T) {
+		dir := t.TempDir()
+		fp := filepath.Join(dir, "bad.json")
+		if err := os.WriteFile(fp, []byte(`{not valid`), 0644); err != nil {
+			t.Fatal(err)
+		}
+		err := loadJSONFile(fp, &struct{}{})
+		if err == nil {
+			t.Error("loadJSONFile() expected error for invalid JSON")
+		}
+	})
+}
+
+func TestQuoteIdentifier(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"simple name", "users", "`users`"},
+		{"with backtick", "col`name", "`col``name`"},
+		{"multiple backticks", "a`b`c", "`a``b``c`"},
+		{"empty string", "", "``"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := quoteIdentifier(tt.in)
+			if got != tt.want {
+				t.Errorf("quoteIdentifier(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMaskDSNPassword(t *testing.T) {
+	tests := []struct {
+		name string
+		dsn  string
+		want string
+	}{
+		{"no password", "user@tcp(host:3306)/db", "user@tcp(host:3306)/db"},
+		{"simple password", "user:pass@tcp(host:3306)/db", "user:***@tcp(host:3306)/db"},
+		{"password with @", "user:p@ssword@tcp(host:3306)/db", "user:***@tcp(host:3306)/db"},
+		{"password with multiple @", "user:a@b@c@tcp(host:3306)/db", "user:***@tcp(host:3306)/db"},
+		{"empty DSN", "", ""},
+		{"no @ sign", "invalid-dsn", "invalid-dsn"},
+		{"colon but no @", "user:pass", "user:pass"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := maskDSNPassword(tt.dsn)
+			if got != tt.want {
+				t.Errorf("maskDSNPassword(%q) = %q, want %q", tt.dsn, got, tt.want)
 			}
 		})
 	}

@@ -5,6 +5,7 @@
 package internal
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/xanygo/anygo/xt"
@@ -35,21 +36,6 @@ func TestSchemaSync_getAlterDataBySchema(t *testing.T) {
 				Config: &Config{},
 			},
 			want: testLoadFile("testdata/user/result_1.sql"),
-		},
-		{
-			name: "user 0-1 ssc",
-			args: args{
-				table:   "user",
-				sSchema: testLoadFile("testdata/user/user_0.sql"),
-				dSchema: testLoadFile("testdata/user/user_1.sql"),
-				cfg: &Config{
-					SingleSchemaChange: true,
-				},
-			},
-			sc: &SchemaSync{
-				Config: &Config{},
-			},
-			want: testLoadFile("testdata/user/result_2.sql"),
 		},
 		{
 			name: "user 0-1 ssc",
@@ -102,6 +88,95 @@ func TestSchemaSync_getAlterDataBySchema(t *testing.T) {
 			xt.Equal(t, tt.want, got.String())
 		})
 	}
+}
+
+func TestSchemaSync_FieldOrder(t *testing.T) {
+	// Source: fields in order id, name, email
+	sourceSchema := "CREATE TABLE `user` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `name` varchar(100) NOT NULL,\n  `email` varchar(200) NOT NULL,\n  PRIMARY KEY (`id`)\n)"
+	// Dest: fields in order id, email, name (different order)
+	destSchema := "CREATE TABLE `user` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `email` varchar(200) NOT NULL,\n  `name` varchar(100) NOT NULL,\n  PRIMARY KEY (`id`)\n)"
+
+	sourceFields := map[string]*FieldInfo{
+		"id":    {ColumnName: "id", ColumnType: "bigint", DataType: "bigint", IsNullAble: "NO", OrdinalPosition: 1, Extra: "auto_increment"},
+		"name":  {ColumnName: "name", ColumnType: "varchar(100)", DataType: "varchar", IsNullAble: "NO", OrdinalPosition: 2},
+		"email": {ColumnName: "email", ColumnType: "varchar(200)", DataType: "varchar", IsNullAble: "NO", OrdinalPosition: 3},
+	}
+	destFields := map[string]*FieldInfo{
+		"id":    {ColumnName: "id", ColumnType: "bigint", DataType: "bigint", IsNullAble: "NO", OrdinalPosition: 1, Extra: "auto_increment"},
+		"email": {ColumnName: "email", ColumnType: "varchar(200)", DataType: "varchar", IsNullAble: "NO", OrdinalPosition: 2},
+		"name":  {ColumnName: "name", ColumnType: "varchar(100)", DataType: "varchar", IsNullAble: "NO", OrdinalPosition: 3},
+	}
+
+	t.Run("FieldOrder disabled - no MODIFY for order difference", func(t *testing.T) {
+		sc := &SchemaSync{Config: &Config{FieldOrder: false}}
+		cfg := &Config{FieldOrder: false}
+		sd := sc.getAlterDataBySchema("user", sourceSchema, destSchema, cfg)
+		sd.SchemaDiff = NewSchemaDiffWithFieldInfos("user",
+			RemoveTableSchemaConfig(sourceSchema), RemoveTableSchemaConfig(destSchema),
+			sourceFields, destFields)
+		diffLines := sc.getSchemaDiff(sd)
+		t.Logf("diffLines: %v", diffLines)
+		for _, line := range diffLines {
+			if strings.Contains(line, "MODIFY COLUMN") {
+				t.Errorf("FieldOrder disabled, should not generate MODIFY COLUMN, got: %s", line)
+			}
+		}
+	})
+
+	t.Run("FieldOrder enabled - MODIFY for order difference", func(t *testing.T) {
+		sc := &SchemaSync{Config: &Config{FieldOrder: true}}
+		cfg := &Config{FieldOrder: true}
+		sd := sc.getAlterDataBySchema("user", sourceSchema, destSchema, cfg)
+		sd.SchemaDiff = NewSchemaDiffWithFieldInfos("user",
+			RemoveTableSchemaConfig(sourceSchema), RemoveTableSchemaConfig(destSchema),
+			sourceFields, destFields)
+		diffLines := sc.getSchemaDiff(sd)
+		t.Logf("diffLines: %v", diffLines)
+		hasModify := false
+		for _, line := range diffLines {
+			if strings.Contains(line, "MODIFY COLUMN") {
+				hasModify = true
+			}
+		}
+		if !hasModify {
+			t.Error("FieldOrder enabled, expected MODIFY COLUMN for order difference")
+		}
+	})
+}
+
+func TestSchemaSync_Drop(t *testing.T) {
+	// Source: only has id, name
+	sourceSchema := "CREATE TABLE `user` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `name` varchar(100) NOT NULL,\n  PRIMARY KEY (`id`)\n)"
+	// Dest: has id, name, extra_field (extra column)
+	destSchema := "CREATE TABLE `user` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `name` varchar(100) NOT NULL,\n  `extra_field` varchar(50) DEFAULT NULL,\n  PRIMARY KEY (`id`)\n)"
+
+	t.Run("Drop disabled - extra field not dropped", func(t *testing.T) {
+		sc := &SchemaSync{Config: &Config{Drop: false}}
+		cfg := &Config{Drop: false}
+		got := sc.getAlterDataBySchema("user", sourceSchema, destSchema, cfg)
+		t.Logf("alter result: %s", got.String())
+		for _, sql := range got.SQL {
+			if strings.Contains(sql, "drop") {
+				t.Errorf("Drop disabled, should not generate DROP, got: %s", sql)
+			}
+		}
+	})
+
+	t.Run("Drop enabled - extra field is dropped", func(t *testing.T) {
+		sc := &SchemaSync{Config: &Config{Drop: true}}
+		cfg := &Config{Drop: true}
+		got := sc.getAlterDataBySchema("user", sourceSchema, destSchema, cfg)
+		t.Logf("alter result: %s", got.String())
+		hasDrop := false
+		for _, sql := range got.SQL {
+			if strings.Contains(sql, "drop `extra_field`") {
+				hasDrop = true
+			}
+		}
+		if !hasDrop {
+			t.Error("Drop enabled, expected DROP for extra_field")
+		}
+	})
 }
 
 func TestSchemaSync_SkipTimestampToDatetime(t *testing.T) {

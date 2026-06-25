@@ -190,12 +190,32 @@ func TestFieldInfo_DefaultCharsets(t *testing.T) {
 			shouldEqual:   true,
 		},
 		{
-			name:          "different charset: ascii vs utf8mb4",
+			name:          "nil vs ascii - treated as equal (nil inherits table default, can't verify at column level)",
 			charsetName:   stringPtr("ascii"),
 			collationName: stringPtr("ascii_general_ci"),
-			shouldEqual:   false,
+			shouldEqual:   true,
 		},
 	}
+
+	// Additional test: both set but different values should NOT be equal
+	t.Run("both set, different charset - should not be equal", func(t *testing.T) {
+		field1 := &FieldInfo{
+			ColumnName:    "test_field",
+			ColumnType:    "varchar(100)",
+			IsNullAble:    "NO",
+			CharsetName:   stringPtr("latin1"),
+			CollationName: stringPtr("latin1_swedish_ci"),
+		}
+		field2 := &FieldInfo{
+			ColumnName:    "test_field",
+			ColumnType:    "varchar(100)",
+			IsNullAble:    "NO",
+			CharsetName:   stringPtr("utf8mb4"),
+			CollationName: stringPtr("utf8mb4_general_ci"),
+		}
+		xt.False(t, field1.Equals(field2))
+		xt.False(t, field2.Equals(field1))
+	})
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
