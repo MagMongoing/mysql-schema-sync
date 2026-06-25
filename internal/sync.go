@@ -212,6 +212,13 @@ func (sc *SchemaSync) getSchemaDiff(alter *TableAlterData) []string {
 							}
 						} else {
 							// Fields are genuinely different
+							// Check if we should skip timestamp → datetime conversion
+							if sc.Config.SkipTimestampToDatetime && isTimestampDatetimeEquivalent(sourceFieldInfo, destFieldInfo) {
+								log.Printf("[Debug] field %s.%s: timestamp vs datetime equivalent, skipping (SkipTimestampToDatetime enabled)", table, fieldName)
+								beforeFieldName = fieldName
+								fieldCount++
+								continue
+							}
 							alterSQL = fmt.Sprintf("CHANGE `%s` %s", fieldName, sourceFieldInfo.String())
 							log.Printf("[Debug] field %s.%s: confirmed difference via structured comparison", table, fieldName)
 							log.Printf("[Debug] source: %+v", sourceFieldInfo)
@@ -258,7 +265,12 @@ func (sc *SchemaSync) getSchemaDiff(alter *TableAlterData) []string {
 			var alterSQL string
 			if destDt, has := destMyS.Fields.Get(fieldName); has {
 				if value != destDt {
-					alterSQL = fmt.Sprintf("CHANGE `%s` %s", fieldName, value)
+					// Check if we should skip timestamp → datetime conversion
+					if sc.Config.SkipTimestampToDatetime && isTextTimestampDatetimeSkip(value, destDt) {
+						log.Printf("[Debug] field %s.%s: timestamp vs datetime text skip (SkipTimestampToDatetime enabled)", table, fieldName)
+					} else {
+						alterSQL = fmt.Sprintf("CHANGE `%s` %s", fieldName, value)
+					}
 				}
 				beforeFieldName = fieldName
 			} else {

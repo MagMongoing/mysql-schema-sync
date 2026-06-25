@@ -43,6 +43,9 @@ type Config struct {
 
 	// SingleSchemaChange 生成sql ddl语言每条命令只会进行单个修改操作
 	SingleSchemaChange bool `json:"single_schema_change"`
+
+	// SkipTimestampToDatetime 当源库字段为 timestamp、目标库为 datetime 时，跳过类型变更（不覆盖目标库的 datetime）
+	SkipTimestampToDatetime bool `json:"skip_timestamp_to_datetime"`
 }
 
 func (cfg *Config) String() string {

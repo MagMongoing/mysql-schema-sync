@@ -415,3 +415,201 @@ func TestFieldInfo_String(t *testing.T) {
 func stringPtr(s string) *string {
 	return &s
 }
+
+func TestIsTimestampDatetimeEquivalent(t *testing.T) {
+	tests := []struct {
+		name   string
+		source *FieldInfo
+		dest   *FieldInfo
+		want   bool
+	}{
+		{
+			name: "timestamp vs datetime, same everything else - should skip",
+			source: &FieldInfo{
+				ColumnName: "created_at",
+				ColumnType: "timestamp",
+				DataType:   "timestamp",
+				IsNullAble: "NO",
+			},
+			dest: &FieldInfo{
+				ColumnName: "created_at",
+				ColumnType: "datetime",
+				DataType:   "datetime",
+				IsNullAble: "NO",
+			},
+			want: true,
+		},
+		{
+			name: "datetime vs timestamp (reverse direction) - should NOT skip",
+			source: &FieldInfo{
+				ColumnName: "created_at",
+				ColumnType: "datetime",
+				DataType:   "datetime",
+				IsNullAble: "NO",
+			},
+			dest: &FieldInfo{
+				ColumnName: "created_at",
+				ColumnType: "timestamp",
+				DataType:   "timestamp",
+				IsNullAble: "NO",
+			},
+			want: false,
+		},
+		{
+			name: "timestamp vs datetime with same default and extra - should skip",
+			source: &FieldInfo{
+				ColumnName:    "updated_at",
+				ColumnType:    "timestamp",
+				DataType:      "timestamp",
+				IsNullAble:    "NO",
+				ColumnDefault: stringPtr("CURRENT_TIMESTAMP"),
+				Extra:         "on update CURRENT_TIMESTAMP",
+			},
+			dest: &FieldInfo{
+				ColumnName:    "updated_at",
+				ColumnType:    "datetime",
+				DataType:      "datetime",
+				IsNullAble:    "NO",
+				ColumnDefault: stringPtr("CURRENT_TIMESTAMP"),
+				Extra:         "on update CURRENT_TIMESTAMP",
+			},
+			want: true,
+		},
+		{
+			name: "timestamp vs datetime with different nullability - should NOT skip",
+			source: &FieldInfo{
+				ColumnName: "created_at",
+				ColumnType: "timestamp",
+				DataType:   "timestamp",
+				IsNullAble: "NO",
+			},
+			dest: &FieldInfo{
+				ColumnName: "created_at",
+				ColumnType: "datetime",
+				DataType:   "datetime",
+				IsNullAble: "YES",
+			},
+			want: false,
+		},
+		{
+			name: "timestamp vs datetime with different defaults - should NOT skip",
+			source: &FieldInfo{
+				ColumnName:    "created_at",
+				ColumnType:    "timestamp",
+				DataType:      "timestamp",
+				IsNullAble:    "NO",
+				ColumnDefault: stringPtr("CURRENT_TIMESTAMP"),
+			},
+			dest: &FieldInfo{
+				ColumnName:    "created_at",
+				ColumnType:    "datetime",
+				DataType:      "datetime",
+				IsNullAble:    "NO",
+				ColumnDefault: stringPtr("2024-01-01 00:00:00"),
+			},
+			want: false,
+		},
+		{
+			name: "varchar vs varchar - should NOT skip (not timestamp/datetime)",
+			source: &FieldInfo{
+				ColumnName: "name",
+				ColumnType: "varchar(64)",
+				DataType:   "varchar",
+				IsNullAble: "NO",
+			},
+			dest: &FieldInfo{
+				ColumnName: "name",
+				ColumnType: "varchar(128)",
+				DataType:   "varchar",
+				IsNullAble: "NO",
+			},
+			want: false,
+		},
+		{
+			name: "timestamp(3) vs datetime(3) with same precision - should skip",
+			source: &FieldInfo{
+				ColumnName: "created_at",
+				ColumnType: "timestamp(3)",
+				DataType:   "timestamp",
+				IsNullAble: "NO",
+			},
+			dest: &FieldInfo{
+				ColumnName: "created_at",
+				ColumnType: "datetime(3)",
+				DataType:   "datetime",
+				IsNullAble: "NO",
+			},
+			want: true,
+		},
+		{
+			name: "timestamp vs datetime(3) with different precision - should NOT skip",
+			source: &FieldInfo{
+				ColumnName: "created_at",
+				ColumnType: "timestamp",
+				DataType:   "timestamp",
+				IsNullAble: "NO",
+			},
+			dest: &FieldInfo{
+				ColumnName: "created_at",
+				ColumnType: "datetime(3)",
+				DataType:   "datetime",
+				IsNullAble: "NO",
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isTimestampDatetimeEquivalent(tt.source, tt.dest)
+			xt.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestIsTextTimestampDatetimeSkip(t *testing.T) {
+	tests := []struct {
+		name       string
+		sourceText string
+		destText   string
+		want       bool
+	}{
+		{
+			name:       "simple timestamp vs datetime",
+			sourceText: "`created_at` timestamp NOT NULL",
+			destText:   "`created_at` datetime NOT NULL",
+			want:       true,
+		},
+		{
+			name:       "timestamp with default vs datetime with default",
+			sourceText: "`updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+			destText:   "`updated_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
+			want:       true,
+		},
+		{
+			name:       "reverse: datetime vs timestamp - should NOT skip",
+			sourceText: "`created_at` datetime NOT NULL",
+			destText:   "`created_at` timestamp NOT NULL",
+			want:       false,
+		},
+		{
+			name:       "different nullability - should NOT skip",
+			sourceText: "`created_at` timestamp NOT NULL",
+			destText:   "`created_at` datetime NULL",
+			want:       false,
+		},
+		{
+			name:       "varchar vs varchar - should NOT skip",
+			sourceText: "`name` varchar(64) NOT NULL",
+			destText:   "`name` varchar(128) NOT NULL",
+			want:       false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isTextTimestampDatetimeSkip(tt.sourceText, tt.destText)
+			xt.Equal(t, tt.want, got)
+		})
+	}
+}

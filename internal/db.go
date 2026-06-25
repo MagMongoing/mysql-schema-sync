@@ -135,6 +135,85 @@ func (f *FieldInfo) Equals(other *FieldInfo) bool {
 	return true
 }
 
+// isTimestampDatetimeEquivalent checks if two fields only differ in timestamp vs datetime type.
+// This is used when SkipTimestampToDatetime is enabled, to avoid overwriting datetime fields
+// in the destination database with timestamp fields from the source database.
+func isTimestampDatetimeEquivalent(source, dest *FieldInfo) bool {
+	srcType := strings.ToLower(source.DataType)
+	dstType := strings.ToLower(dest.DataType)
+
+	// Only handle timestamp → datetime conversion
+	if srcType != "timestamp" || dstType != "datetime" {
+		return false
+	}
+
+	// Create a copy of dest with timestamp type to compare everything else
+	destCopy := *dest
+	destCopy.DataType = "timestamp"
+	destCopy.ColumnType = strings.Replace(destCopy.ColumnType, "datetime", "timestamp", 1)
+	destCopy.ColumnType = strings.Replace(destCopy.ColumnType, "DATETIME", "timestamp", 1)
+
+	return source.Equals(&destCopy)
+}
+
+// isTextTimestampDatetimeSkip checks if the source field text uses timestamp
+// and the dest field text uses datetime, with everything else being equivalent.
+// Used in the legacy text-based comparison path.
+func isTextTimestampDatetimeSkip(sourceText, destText string) bool {
+	src := strings.TrimSpace(sourceText)
+	dst := strings.TrimSpace(destText)
+
+	srcLower := strings.ToLower(src)
+	dstLower := strings.ToLower(dst)
+
+	// Quick check: source must contain "timestamp" and dest must contain "datetime"
+	if !strings.Contains(srcLower, "timestamp") || !strings.Contains(dstLower, "datetime") {
+		return false
+	}
+
+	// Normalize: replace the type portion to compare the rest
+	// Strip backtick-quoted column name prefix if present
+	srcRest := stripFieldNamePrefix(src)
+	dstRest := stripFieldNamePrefix(dst)
+
+	// Replace type keyword for comparison
+	srcNorm := replaceTimestampType(srcRest)
+	dstNorm := replaceDatetimeType(dstRest)
+
+	return srcNorm == dstNorm
+}
+
+// stripFieldNamePrefix removes the backtick-quoted column name from a field definition line.
+// e.g., "`created_at` timestamp NOT NULL" → "timestamp NOT NULL"
+func stripFieldNamePrefix(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) > 0 && s[0] == '`' {
+		idx := strings.Index(s[1:], "`")
+		if idx >= 0 {
+			return strings.TrimSpace(s[idx+2:])
+		}
+	}
+	return s
+}
+
+// replaceTimestampType replaces the timestamp type keyword with a normalized placeholder
+func replaceTimestampType(s string) string {
+	lower := strings.ToLower(s)
+	if strings.HasPrefix(lower, "timestamp") {
+		return "NORMALIZED_TYPE" + s[len("timestamp"):]
+	}
+	return s
+}
+
+// replaceDatetimeType replaces the datetime type keyword with a normalized placeholder
+func replaceDatetimeType(s string) string {
+	lower := strings.ToLower(s)
+	if strings.HasPrefix(lower, "datetime") {
+		return "NORMALIZED_TYPE" + s[len("datetime"):]
+	}
+	return s
+}
+
 // charsetEquals checks if character sets are semantically equal
 func (f *FieldInfo) charsetEquals(other *FieldInfo) bool {
 	// Both NULL
