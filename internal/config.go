@@ -6,6 +6,7 @@ import (
 	"html"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -60,7 +61,12 @@ func (cfg *Config) String() string {
 		emailCopy.Password = "***"
 		masked.Email = &emailCopy
 	}
-	ds, _ := json.MarshalIndent(&masked, "  ", "  ")
+	// L3: log the MarshalIndent error instead of silently discarding it.
+	ds, err := json.MarshalIndent(&masked, "  ", "  ")
+	if err != nil {
+		log.Printf("[WARN] Config.String() marshal failed: %s", err)
+		return "<marshal error>"
+	}
 	return string(ds)
 }
 
@@ -205,8 +211,10 @@ func (cfg *Config) SendMailFail(errStr string) {
 	body += "host:" + html.EscapeString(_host) + "<br/>"
 	body += "config-file:" + html.EscapeString(cfg.ConfigPath) + "<br/>"
 	body += "dest_dsn:" + html.EscapeString(maskDSNPassword(cfg.DestDSN)) + "<br/>"
+	// L9: use filepath.Base to avoid leaking the operator's home directory
+	// path in failure mail. The project directory name is usually sufficient.
 	pwd, _ := os.Getwd()
-	body += "pwd:" + html.EscapeString(pwd) + "<br/>"
+	body += "pwd:" + html.EscapeString(filepath.Base(pwd)) + "<br/>"
 	cfg.Email.SendMail(title, body)
 }
 

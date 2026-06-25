@@ -1,11 +1,14 @@
 package internal
 
 import (
-	"fmt"
+	"sync"
 	"time"
 )
 
+// myTimer is a simple start/stop timer. L7: guarded by sync.RWMutex so
+// concurrent stop()/usedSecond() calls don't race.
 type myTimer struct {
+	mu    sync.RWMutex
 	start time.Time
 	end   time.Time
 }
@@ -17,12 +20,20 @@ func newMyTimer() *myTimer {
 }
 
 func (mt *myTimer) stop() {
+	mt.mu.Lock()
 	mt.end = time.Now()
+	mt.mu.Unlock()
 }
 
 func (mt *myTimer) usedSecond() string {
-	if mt.end.IsZero() {
+	mt.mu.RLock()
+	end := mt.end
+	start := mt.start
+	mt.mu.RUnlock()
+	if end.IsZero() {
 		return "N/A"
 	}
-	return fmt.Sprintf("%f s", mt.end.Sub(mt.start).Seconds())
+	// L8: use Duration.String() for human-friendly formatting.
+	d := end.Sub(start)
+	return d.String()
 }

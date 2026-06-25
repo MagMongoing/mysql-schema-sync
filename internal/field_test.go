@@ -54,24 +54,6 @@ func TestFieldInfo_Equals(t *testing.T) {
 			equal: true,
 		},
 		{
-			name: "same field with different charset",
-			field1: &FieldInfo{
-				ColumnName:    "name",
-				ColumnType:    "varchar(64)",
-				IsNullAble:    "NO",
-				CharsetName:   nil,
-				CollationName: nil,
-			},
-			field2: &FieldInfo{
-				ColumnName:    "name",
-				ColumnType:    "varchar(64)",
-				IsNullAble:    "NO",
-				CharsetName:   stringPtr("utf8mb4"),
-				CollationName: stringPtr("utf8mb4_general_ci"),
-			},
-			equal: true,
-		},
-		{
 			name: "different field type",
 			field1: &FieldInfo{
 				ColumnName:    "name",
@@ -108,7 +90,7 @@ func TestFieldInfo_Equals(t *testing.T) {
 			equal: false,
 		},
 		{
-			name: "same field with default collation",
+			name: "nil charset and collation vs explicit utf8mb4_unicode_ci — both tolerated",
 			field1: &FieldInfo{
 				ColumnName:    "name",
 				ColumnType:    "varchar(64)",
@@ -401,6 +383,30 @@ func TestFieldInfo_String(t *testing.T) {
 			},
 			want: "`updated_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
 		},
+		{
+			name: "generated column VIRTUAL",
+			field: &FieldInfo{
+				ColumnName:           "full_name",
+				ColumnType:           "varchar(201)",
+				IsNullAble:           "YES",
+				DataType:             "varchar",
+				GenerationExpression: "concat(`first_name`,' ',`last_name`)",
+				Extra:                "VIRTUAL GENERATED",
+			},
+			want: "`full_name` varchar(201) GENERATED ALWAYS AS (concat(`first_name`,' ',`last_name`)) NULL VIRTUAL",
+		},
+		{
+			name: "generated column STORED NOT NULL",
+			field: &FieldInfo{
+				ColumnName:           "total",
+				ColumnType:           "decimal(12,2)",
+				IsNullAble:           "NO",
+				DataType:             "decimal",
+				GenerationExpression: "`price` * `quantity`",
+				Extra:                "STORED GENERATED",
+			},
+			want: "`total` decimal(12,2) GENERATED ALWAYS AS (`price` * `quantity`) NOT NULL STORED",
+		},
 	}
 
 	for _, tt := range tests {
@@ -686,5 +692,73 @@ func TestIsTextTimestampDatetimeSkip(t *testing.T) {
 			got := isTextTimestampDatetimeSkip(tt.sourceText, tt.destText)
 			xt.Equal(t, tt.want, got)
 		})
+	}
+}
+
+// TestFieldInfo_Equals_SameCharsetDifferentCollation verifies that fields
+// with matching charset but different collation are NOT equal. M5.
+func TestFieldInfo_Equals_SameCharsetDifferentCollation(t *testing.T) {
+	field1 := &FieldInfo{
+		ColumnName:    "name",
+		ColumnType:    "varchar(64)",
+		DataType:      "varchar",
+		IsNullAble:    "NO",
+		CharsetName:   stringPtr("utf8mb4"),
+		CollationName: stringPtr("utf8mb4_general_ci"),
+	}
+	field2 := &FieldInfo{
+		ColumnName:    "name",
+		ColumnType:    "varchar(64)",
+		DataType:      "varchar",
+		IsNullAble:    "NO",
+		CharsetName:   stringPtr("utf8mb4"),
+		CollationName: stringPtr("utf8mb4_unicode_ci"),
+	}
+	if field1.Equals(field2) {
+		t.Error("fields with same charset but different collation should NOT be equal")
+	}
+	if field2.Equals(field1) {
+		t.Error("symmetry: fields with same charset but different collation should NOT be equal")
+	}
+}
+
+// TestFieldInfo_Equals_DifferentComment verifies that fields differing
+// only in ColumnComment are NOT equal. L13.
+func TestFieldInfo_Equals_DifferentComment(t *testing.T) {
+	field1 := &FieldInfo{
+		ColumnName:    "status",
+		ColumnType:    "tinyint",
+		DataType:      "tinyint",
+		IsNullAble:    "NO",
+		ColumnComment: "old comment",
+	}
+	field2 := &FieldInfo{
+		ColumnName:    "status",
+		ColumnType:    "tinyint",
+		DataType:      "tinyint",
+		IsNullAble:    "NO",
+		ColumnComment: "new comment",
+	}
+	if field1.Equals(field2) {
+		t.Error("fields differing only in ColumnComment should NOT be equal")
+	}
+
+	// Same comment should be equal
+	field3 := &FieldInfo{
+		ColumnName:    "status",
+		ColumnType:    "tinyint",
+		DataType:      "tinyint",
+		IsNullAble:    "NO",
+		ColumnComment: "same comment",
+	}
+	field4 := &FieldInfo{
+		ColumnName:    "status",
+		ColumnType:    "tinyint",
+		DataType:      "tinyint",
+		IsNullAble:    "NO",
+		ColumnComment: "same comment",
+	}
+	if !field3.Equals(field4) {
+		t.Error("fields with same ColumnComment should be equal")
 	}
 }

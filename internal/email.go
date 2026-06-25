@@ -92,10 +92,23 @@ func (m *EmailStruct) SendMail(title string, body string) {
 	if err == nil {
 		log.Println("send mail success")
 	} else {
-		// Sanitize error to avoid leaking SMTP credentials in logs
+		// Sanitize error to avoid leaking SMTP credentials in logs.
+		// For very short passwords, literal substring replacement risks corrupting
+		// the diagnostic message — fall back to a generic error in that case.
 		errMsg := err.Error()
-		if len(m.Password) > 0 {
+		if len(m.Password) >= 10 {
 			errMsg = strings.ReplaceAll(errMsg, m.Password, "***")
+		} else if len(m.Password) > 0 {
+			errMsg = "send mail failed (error redacted to prevent short-password leakage)"
+		}
+		// Also redact the SMTP username (From) — SMTP error replies routinely
+		// echo the AUTH username back, and combined with host context this leaks
+		// the account identity. M6: for short usernames where literal replacement
+		// may corrupt diagnostic words, redact the entire error.
+		if len(m.From) >= 4 {
+			errMsg = strings.ReplaceAll(errMsg, m.From, "***")
+		} else if len(m.From) > 0 {
+			errMsg = "send mail failed (error redacted to prevent short-username leakage)"
 		}
 		log.Println("send mail failed, err:", errMsg)
 	}

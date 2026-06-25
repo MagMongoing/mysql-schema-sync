@@ -88,8 +88,10 @@ func (mys *MySchema) RelationTables() []string {
 
 // extractQuotedIdentifier extracts an identifier from a line that starts with the
 // given quote character. Handles doubled quotes (e.g., `` `col``name` `` → "col`name").
-// Returns the identifier without quotes, or "" if the line is malformed.
-func extractQuotedIdentifier(line string, quote byte) string {
+// Returns (identifier, true) on success, ("", false) if the line is malformed
+// (no closing quote). M16: distinguishes empty identifier (``, ok=true) from
+// malformed input (ok=false).
+func extractQuotedIdentifier(line string, quote byte) (string, bool) {
 	// line starts with the quote character; skip it
 	var name []byte
 	i := 1
@@ -102,12 +104,12 @@ func extractQuotedIdentifier(line string, quote byte) string {
 				continue
 			}
 			// Single quote → end of identifier
-			return string(name)
+			return string(name), true
 		}
 		name = append(name, line[i])
 		i++
 	}
-	return "" // no closing quote found
+	return "", false // no closing quote found
 }
 
 // ParseSchema parse table's schema
@@ -128,18 +130,23 @@ func ParseSchema(schema string) *MySchema {
 		}
 
 		line = strings.TrimRight(line, ",")
+		// TrimRight may have consumed every byte (e.g. a stray "," line);
+		// re-check length before indexing to avoid an out-of-range panic.
+		if len(line) == 0 {
+			continue
+		}
 		switch line[0] {
 		case '`':
-			name := extractQuotedIdentifier(line, '`')
-			if name == "" {
-				continue // malformed line: no closing backtick
+			name, ok := extractQuotedIdentifier(line, '`')
+			if !ok || name == "" {
+				continue // malformed line or empty identifier
 			}
 			mys.Fields.Set(name, line)
 
 		case '"':
-			name := extractQuotedIdentifier(line, '"')
-			if name == "" {
-				continue // malformed line: no closing double quote
+			name, ok := extractQuotedIdentifier(line, '"')
+			if !ok || name == "" {
+				continue // malformed line or empty identifier
 			}
 			mys.Fields.Set(name, line)
 
@@ -173,12 +180,11 @@ func newSchemaDiff(table, source, dest string) *SchemaDiff {
 	}
 }
 
-// NewSchemaWithFieldInfos creates a MySchema with structured field information
+// NewSchemaWithFieldInfos creates a MySchema with structured field information.
+// ParseSchema always returns a non-nil *MySchema, so no nil-guard is needed.
 func NewSchemaWithFieldInfos(schema string, fieldInfos map[string]*FieldInfo) *MySchema {
 	mys := ParseSchema(schema)
-	if mys != nil {
-		mys.FieldInfos = fieldInfos
-	}
+	mys.FieldInfos = fieldInfos
 	return mys
 }
 

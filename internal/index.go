@@ -24,7 +24,7 @@ const (
 	indexTypePrimary    indexType = "PRIMARY"
 	indexTypeIndex      indexType = "INDEX"
 	indexTypeForeignKey indexType = "FOREIGN KEY"
-	indexTypeCheck indexType = "CHECK"
+	indexTypeCheck      indexType = "CHECK"
 )
 
 func (idx *DbIndex) alterAddSQL(drop bool) []string {
@@ -82,13 +82,15 @@ func (idx *DbIndex) addRelationTable(table string) {
 }
 
 // 匹配索引字段
-var indexReg = regexp.MustCompile(`^([A-Z]+\s)?KEY\s+` + "`")
+// L6: (?i) flag to tolerate MariaDB / dump tools that emit lowercase keywords.
+var indexReg = regexp.MustCompile(`(?i)^([A-Z]+\s)?KEY\s+` + "`")
 
-// 匹配外键
-var foreignKeyReg = regexp.MustCompile("^CONSTRAINT `([^`]+)` FOREIGN KEY.+ REFERENCES `([^`]+)` ")
+// 匹配外键 — H5: regex no longer captures identifier names directly; we use
+// extractQuotedIdentifier for doubled-backtick safety instead.
+var foreignKeyReg = regexp.MustCompile(`(?i)^CONSTRAINT\s+`)
 
-// Check约束
-var checkConstraintReg = regexp.MustCompile("^CONSTRAINT `([^`]+)` CHECK \\(\\(?(.+?)\\)?\\)")
+// Check约束 — H5: same approach as foreignKeyReg.
+var checkConstraintReg = regexp.MustCompile(`(?i)^CONSTRAINT\s+`)
 
 func parseDbIndexLine(line string) *DbIndex {
 	line = strings.TrimSpace(line)
@@ -109,8 +111,8 @@ func parseDbIndexLine(line string) *DbIndex {
 	if indexReg.MatchString(line) {
 		// Use extractQuotedIdentifier to handle doubled backticks in index names
 		idx.IndexType = indexTypeIndex
-		name := extractQuotedIdentifier(line[strings.IndexByte(line, '`'):], '`')
-		if name == "" {
+		name, ok := extractQuotedIdentifier(line[strings.IndexByte(line, '`'):], '`')
+		if !ok || name == "" {
 			log.Printf("[WARN] db_index parse skipped: KEY line without backticks: %s", line)
 			return nil
 		}
@@ -119,19 +121,46 @@ func parseDbIndexLine(line string) *DbIndex {
 	}
 
 	// CONSTRAINT `busi_table_ibfk_1` FOREIGN KEY (`repo_id`) REFERENCES `repo_table` (`repo_id`)
-	foreignMatches := foreignKeyReg.FindStringSubmatch(line)
-	if len(foreignMatches) > 0 {
+	// H5: use extractQuotedIdentifier for doubled-backtick safety in constraint
+	// and referenced-table names.
+	if foreignKeyReg.MatchString(line) && strings.Contains(line, "FOREIGN KEY") {
+		constraintStart := strings.IndexByte(line, '`')
+		if constraintStart < 0 {
+			log.Printf("[WARN] db_index parse skipped: CONSTRAINT line without backticks: %s", line)
+			return nil
+		}
+		constraintName, ok := extractQuotedIdentifier(line[constraintStart:], '`')
+		if !ok || constraintName == "" {
+			log.Printf("[WARN] db_index parse skipped: CONSTRAINT FK with unclosed name: %s", line)
+			return nil
+		}
 		idx.IndexType = indexTypeForeignKey
-		idx.Name = foreignMatches[1]
-		idx.addRelationTable(foreignMatches[2])
+		idx.Name = constraintName
+		// Extract referenced table name from REFERENCES `<tbl>`
+		refIdx := strings.Index(line, "REFERENCES `")
+		if refIdx >= 0 {
+			refTable, refOk := extractQuotedIdentifier(line[refIdx+len("REFERENCES "):], '`')
+			if refOk && refTable != "" {
+				idx.addRelationTable(refTable)
+			}
+		}
 		return idx
 	}
 
 	// CONSTRAINT `chk_xx_1` CHECK ((`x` >= 0 and `y` <= 100))
-	checkMatches := checkConstraintReg.FindStringSubmatch(line)
-	if len(checkMatches) > 0 {
+	if checkConstraintReg.MatchString(line) && strings.Contains(line, "CHECK") {
+		constraintStart := strings.IndexByte(line, '`')
+		if constraintStart < 0 {
+			log.Printf("[WARN] db_index parse skipped: CONSTRAINT line without backticks: %s", line)
+			return nil
+		}
+		constraintName, ok := extractQuotedIdentifier(line[constraintStart:], '`')
+		if !ok || constraintName == "" {
+			log.Printf("[WARN] db_index parse skipped: CONSTRAINT CHECK with unclosed name: %s", line)
+			return nil
+		}
 		idx.IndexType = indexTypeCheck
-		idx.Name = checkMatches[1]
+		idx.Name = constraintName
 		return idx
 	}
 

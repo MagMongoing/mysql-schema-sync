@@ -27,6 +27,7 @@ var debug = flag.Bool("debug", false, "enable verbose debug logging")
 
 func init() {
 	log.SetFlags(log.Lshortfile | log.Ldate)
+	internal.RegisterFlags()
 	df := flag.Usage
 	flag.Usage = func() {
 		df()
@@ -72,11 +73,33 @@ func main() {
 
 	defer (func() {
 		if re := recover(); re != nil {
-			log.Println(re)
-			bf := make([]byte, 4096)
-			n := runtime.Stack(bf, false)
-			cfg.SendMailFail(fmt.Sprintf("panic:%s\n trace=%s", re, bf[:n]))
-			log.Fatalln("panic:", string(bf[:n]))
+			// H1 fix: build the redacted message FIRST, then log only the redacted form.
+			// Previously log.Println(re) emitted the raw panic value (which may embed
+			// DSN credentials) before RedactDSNs ran.
+			panicMsg := fmt.Sprintf("%s", re)
+			// H2 fix: use a growable stack buffer — runtime.Stack returns the number
+			// of bytes written. If the trace exceeds cap we grow until it fits,
+			// so no root-cause bytes are silently truncated.
+			buf := make([]byte, 16384)
+			for {
+				n := runtime.Stack(buf, false)
+				if n < len(buf) {
+					buf = buf[:n]
+					break
+				}
+				buf = make([]byte, len(buf)*2)
+			}
+			trace := string(buf)
+			if cfg != nil {
+				panicMsg = internal.RedactDSNs(panicMsg, cfg.SourceDSN, cfg.DestDSN)
+				trace = internal.RedactDSNs(trace, cfg.SourceDSN, cfg.DestDSN)
+			}
+			body := fmt.Sprintf("panic:%s\n trace=%s", panicMsg, trace)
+			if cfg != nil {
+				cfg.SendMailFail(body)
+			}
+			log.Printf("panic:%s\n trace=%s", panicMsg, trace)
+			os.Exit(1)
 		}
 	})()
 

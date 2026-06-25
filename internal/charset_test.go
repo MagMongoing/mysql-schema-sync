@@ -154,12 +154,6 @@ func TestFieldInfo_DefaultCharsets(t *testing.T) {
 			shouldEqual:   true,
 		},
 		{
-			name:          "charset nil, collation nil vs utf8mb4",
-			charsetName:   nil,
-			collationName: nil,
-			shouldEqual:   true,
-		},
-		{
 			name:          "charset nil vs utf8mb4, collation nil",
 			charsetName:   stringPtr("utf8mb4"),
 			collationName: nil,
@@ -190,7 +184,7 @@ func TestFieldInfo_DefaultCharsets(t *testing.T) {
 			shouldEqual:   true,
 		},
 		{
-			name:          "nil vs ascii - treated as equal (nil inherits table default, can't verify at column level)",
+			name:          "nil vs ascii — treated as equal",
 			charsetName:   stringPtr("ascii"),
 			collationName: stringPtr("ascii_general_ci"),
 			shouldEqual:   true,

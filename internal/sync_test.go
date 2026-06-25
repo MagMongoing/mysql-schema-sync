@@ -5,9 +5,12 @@
 package internal
 
 import (
+	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/xanygo/anygo/xt"
 )
 
@@ -19,73 +22,91 @@ func TestSchemaSync_getAlterDataBySchema(t *testing.T) {
 		cfg     *Config
 	}
 	tests := []struct {
-		name string
-		sc   *SchemaSync
-		args args
-		want string
+		name     string
+		sc       *SchemaSync
+		argsFunc func(t *testing.T) args
+		wantFunc func(t *testing.T) string
 	}{
 		{
 			name: "user 0-1",
-			args: args{
-				table:   "user",
-				sSchema: testLoadFile("testdata/user/user_0.sql"),
-				dSchema: testLoadFile("testdata/user/user_1.sql"),
-				cfg:     &Config{},
+			argsFunc: func(t *testing.T) args {
+				return args{
+					table:   "user",
+					sSchema: testLoadFile(t, "testdata/user/user_0.sql"),
+					dSchema: testLoadFile(t, "testdata/user/user_1.sql"),
+					cfg:     &Config{},
+				}
 			},
 			sc: &SchemaSync{
 				Config: &Config{},
 			},
-			want: testLoadFile("testdata/user/result_1.sql"),
+			wantFunc: func(t *testing.T) string {
+				return testLoadFile(t, "testdata/user/result_1.sql")
+			},
 		},
 		{
 			name: "user 0-1 ssc",
-			args: args{
-				table:   "user",
-				sSchema: testLoadFile("testdata/user/user_0.sql"),
-				dSchema: testLoadFile("testdata/user/user_1.sql"),
-				cfg: &Config{
-					SingleSchemaChange: true,
-				},
+			argsFunc: func(t *testing.T) args {
+				return args{
+					table:   "user",
+					sSchema: testLoadFile(t, "testdata/user/user_0.sql"),
+					dSchema: testLoadFile(t, "testdata/user/user_1.sql"),
+					cfg: &Config{
+						SingleSchemaChange: true,
+					},
+				}
 			},
 			sc: &SchemaSync{
 				Config: &Config{},
 			},
-			want: testLoadFile("testdata/user/result_2.sql"),
+			wantFunc: func(t *testing.T) string {
+				return testLoadFile(t, "testdata/user/result_2.sql")
+			},
 		},
 		{
 			name: "user 1-0 ssc",
-			args: args{
-				table:   "user",
-				sSchema: testLoadFile("testdata/user/user_1.sql"),
-				dSchema: testLoadFile("testdata/user/user_0.sql"),
-				cfg: &Config{
-					SingleSchemaChange: true,
-				},
+			argsFunc: func(t *testing.T) args {
+				return args{
+					table:   "user",
+					sSchema: testLoadFile(t, "testdata/user/user_1.sql"),
+					dSchema: testLoadFile(t, "testdata/user/user_0.sql"),
+					cfg: &Config{
+						SingleSchemaChange: true,
+					},
+				}
 			},
 			sc: &SchemaSync{
 				Config: &Config{},
 			},
-			want: testLoadFile("testdata/user/result_3.sql"),
+			wantFunc: func(t *testing.T) string {
+				return testLoadFile(t, "testdata/user/result_3.sql")
+			},
 		},
 		{
 			name: "user 2-0 ssc",
-			args: args{
-				table:   "user",
-				sSchema: testLoadFile("testdata/user/user_2.sql"),
-				dSchema: testLoadFile("testdata/user/user_0.sql"),
-				cfg:     &Config{},
+			argsFunc: func(t *testing.T) args {
+				return args{
+					table:   "user",
+					sSchema: testLoadFile(t, "testdata/user/user_2.sql"),
+					dSchema: testLoadFile(t, "testdata/user/user_0.sql"),
+					cfg:     &Config{},
+				}
 			},
 			sc: &SchemaSync{
 				Config: &Config{},
 			},
-			want: testLoadFile("testdata/user/result_4.sql"),
+			wantFunc: func(t *testing.T) string {
+				return testLoadFile(t, "testdata/user/result_4.sql")
+			},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := tt.sc.getAlterDataBySchema(tt.args.table, tt.args.sSchema, tt.args.dSchema, tt.args.cfg)
+			args := tt.argsFunc(t)
+			want := tt.wantFunc(t)
+			got := tt.sc.getAlterDataBySchema(args.table, args.sSchema, args.dSchema, args.cfg)
 			t.Log("got alter:\n", got.String())
-			xt.Equal(t, tt.want, got.String())
+			xt.Equal(t, want, got.String())
 		})
 	}
 }
@@ -155,8 +176,13 @@ func TestSchemaSync_Drop(t *testing.T) {
 		cfg := &Config{Drop: false}
 		got := sc.getAlterDataBySchema("user", sourceSchema, destSchema, cfg)
 		t.Logf("alter result: %s", got.String())
+		// Catch all DROP forms emitted by index.go: DROP COLUMN, DROP INDEX,
+		// DROP FOREIGN KEY, DROP CHECK, DROP PRIMARY KEY, plus the bare
+		// ``DROP `name``` form for columns. Any drop must be flagged when
+		// Drop=false.
+		dropRe := regexp.MustCompile(`(?i)\bdrop\s+(column|index|foreign\s+key|check|primary\s+key|` + "`" + `)`)
 		for _, sql := range got.SQL {
-			if strings.Contains(sql, "drop") {
+			if dropRe.MatchString(sql) {
 				t.Errorf("Drop disabled, should not generate DROP, got: %s", sql)
 			}
 		}
@@ -167,9 +193,12 @@ func TestSchemaSync_Drop(t *testing.T) {
 		cfg := &Config{Drop: true}
 		got := sc.getAlterDataBySchema("user", sourceSchema, destSchema, cfg)
 		t.Logf("alter result: %s", got.String())
+		// M17: use case-insensitive regex to match both "drop `col`" and
+		// "DROP COLUMN `col`" forms, avoiding brittleness on keyword casing.
+		dropExtraRe := regexp.MustCompile(`(?i)drop\s+(?:column\s+)?` + "`" + `extra_field` + "`")
 		hasDrop := false
 		for _, sql := range got.SQL {
-			if strings.Contains(sql, "drop `extra_field`") {
+			if dropExtraRe.MatchString(sql) {
 				hasDrop = true
 			}
 		}
@@ -194,15 +223,19 @@ func TestSchemaSync_SkipTimestampToDatetime(t *testing.T) {
 		if got.Type == alterTypeNo {
 			t.Error("expected alter, got no change")
 		}
-		// Should contain CHANGE statements for timestamp fields
+		// Verify a CHANGE statement is actually emitted for at least one of the
+		// timestamp columns — a generic non-empty check would let unrelated SQL pass.
 		hasChange := false
 		for _, sql := range got.SQL {
-			if len(sql) > 0 {
+			lower := strings.ToLower(sql)
+			if strings.Contains(lower, "change ") &&
+				(strings.Contains(lower, "created_at") || strings.Contains(lower, "updated_at")) {
 				hasChange = true
+				break
 			}
 		}
 		if !hasChange {
-			t.Error("expected CHANGE SQL to be generated")
+			t.Errorf("expected CHANGE SQL targeting created_at/updated_at, got SQL=%v", got.SQL)
 		}
 	})
 
@@ -225,5 +258,161 @@ func TestSchemaSync_SkipTimestampToDatetime(t *testing.T) {
 		if got.Type == alterTypeNo {
 			t.Error("expected alter for varchar difference, got no change")
 		}
+		// L33: negative assertion — verify no CHANGE for timestamp/datetime fields.
+		for _, sql := range got.SQL {
+			lower := strings.ToLower(sql)
+			if strings.Contains(lower, "change ") &&
+				(strings.Contains(lower, "created_at") || strings.Contains(lower, "updated_at")) {
+				t.Errorf("SkipTimestampToDatetime should suppress CHANGE for timestamp fields, got: %s", sql)
+			}
+		}
+		// Also verify that a CHANGE for the name column IS present.
+		hasNameChange := false
+		for _, sql := range got.SQL {
+			if strings.Contains(strings.ToLower(sql), "name") && strings.Contains(strings.ToLower(sql), "change ") {
+				hasNameChange = true
+			}
+		}
+		if !hasNameChange {
+			t.Error("expected CHANGE for name (varchar) difference, but none found")
+		}
 	})
+}
+
+// TestSchemaSync_SkipTimestampToDatetime_StructuredPath verifies the SkipTimestampToDatetime
+// feature through the structured FieldInfo comparison path (production path). M5.
+func TestSchemaSync_SkipTimestampToDatetime_StructuredPath(t *testing.T) {
+	sourceSchema := "CREATE TABLE `orders` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `created_at` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,\n  `name` varchar(100) NOT NULL DEFAULT '',\n  PRIMARY KEY (`id`)\n)"
+	destSchema := "CREATE TABLE `orders` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `created_at` datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,\n  `name` varchar(100) NOT NULL DEFAULT '',\n  PRIMARY KEY (`id`)\n)"
+
+	sourceFields := map[string]*FieldInfo{
+		"id":         {ColumnName: "id", ColumnType: "bigint", DataType: "bigint", IsNullAble: "NO", OrdinalPosition: 1, Extra: "auto_increment"},
+		"created_at": {ColumnName: "created_at", ColumnType: "timestamp", DataType: "timestamp", IsNullAble: "NO", OrdinalPosition: 2, ColumnDefault: stringPtr("CURRENT_TIMESTAMP")},
+		"name":       {ColumnName: "name", ColumnType: "varchar(100)", DataType: "varchar", IsNullAble: "NO", OrdinalPosition: 3, ColumnDefault: stringPtr("")},
+	}
+	destFields := map[string]*FieldInfo{
+		"id":         {ColumnName: "id", ColumnType: "bigint", DataType: "bigint", IsNullAble: "NO", OrdinalPosition: 1, Extra: "auto_increment"},
+		"created_at": {ColumnName: "created_at", ColumnType: "datetime", DataType: "datetime", IsNullAble: "NO", OrdinalPosition: 2, ColumnDefault: stringPtr("CURRENT_TIMESTAMP")},
+		"name":       {ColumnName: "name", ColumnType: "varchar(100)", DataType: "varchar", IsNullAble: "NO", OrdinalPosition: 3, ColumnDefault: stringPtr("")},
+	}
+
+	t.Run("skip flag suppresses timestamp→datetime in structured path", func(t *testing.T) {
+		sc := &SchemaSync{Config: &Config{SkipTimestampToDatetime: true}}
+		cfg := &Config{SkipTimestampToDatetime: true}
+		sd := sc.getAlterDataBySchema("orders", sourceSchema, destSchema, cfg)
+		sd.SchemaDiff = NewSchemaDiffWithFieldInfos("orders",
+			RemoveTableSchemaConfig(sourceSchema), RemoveTableSchemaConfig(destSchema),
+			sourceFields, destFields)
+		diffLines := sc.getSchemaDiff(sd)
+		t.Logf("diffLines: %v", diffLines)
+		for _, line := range diffLines {
+			lower := strings.ToLower(line)
+			if strings.Contains(lower, "created_at") {
+				t.Errorf("SkipTimestampToDatetime should suppress CHANGE for created_at in structured path, got: %s", line)
+			}
+		}
+	})
+
+	t.Run("without skip flag, timestamp→datetime generates CHANGE in structured path", func(t *testing.T) {
+		sc := &SchemaSync{Config: &Config{}}
+		cfg := &Config{}
+		sd := sc.getAlterDataBySchema("orders", sourceSchema, destSchema, cfg)
+		sd.SchemaDiff = NewSchemaDiffWithFieldInfos("orders",
+			RemoveTableSchemaConfig(sourceSchema), RemoveTableSchemaConfig(destSchema),
+			sourceFields, destFields)
+		diffLines := sc.getSchemaDiff(sd)
+		t.Logf("diffLines: %v", diffLines)
+		hasChange := false
+		for _, line := range diffLines {
+			if strings.Contains(strings.ToLower(line), "created_at") && strings.Contains(strings.ToLower(line), "change ") {
+				hasChange = true
+			}
+		}
+		if !hasChange {
+			t.Error("expected CHANGE for created_at in structured path without skip flag")
+		}
+	})
+}
+
+// TestSchemaSync_StructuredPath exercises the production FieldInfo comparison
+// path through getSchemaDiff. M7.
+func TestSchemaSync_StructuredPath(t *testing.T) {
+	sourceSchema := "CREATE TABLE `users` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `name` varchar(100) NOT NULL,\n  `email` varchar(200) NOT NULL DEFAULT '',\n  PRIMARY KEY (`id`)\n)"
+	destSchema := "CREATE TABLE `users` (\n  `id` bigint NOT NULL AUTO_INCREMENT,\n  `name` varchar(200) NOT NULL,\n  `email` varchar(200) NOT NULL DEFAULT '',\n  PRIMARY KEY (`id`)\n)"
+
+	sourceFields := map[string]*FieldInfo{
+		"id":    {ColumnName: "id", ColumnType: "bigint", DataType: "bigint", IsNullAble: "NO", OrdinalPosition: 1, Extra: "auto_increment"},
+		"name":  {ColumnName: "name", ColumnType: "varchar(100)", DataType: "varchar", IsNullAble: "NO", OrdinalPosition: 2},
+		"email": {ColumnName: "email", ColumnType: "varchar(200)", DataType: "varchar", IsNullAble: "NO", OrdinalPosition: 3, ColumnDefault: stringPtr("")},
+	}
+	destFields := map[string]*FieldInfo{
+		"id":    {ColumnName: "id", ColumnType: "bigint", DataType: "bigint", IsNullAble: "NO", OrdinalPosition: 1, Extra: "auto_increment"},
+		"name":  {ColumnName: "name", ColumnType: "varchar(200)", DataType: "varchar", IsNullAble: "NO", OrdinalPosition: 2},
+		"email": {ColumnName: "email", ColumnType: "varchar(200)", DataType: "varchar", IsNullAble: "NO", OrdinalPosition: 3, ColumnDefault: stringPtr("")},
+	}
+
+	t.Run("varchar length change detected via structured path", func(t *testing.T) {
+		sc := &SchemaSync{Config: &Config{}}
+		cfg := &Config{}
+		sd := sc.getAlterDataBySchema("users", sourceSchema, destSchema, cfg)
+		sd.SchemaDiff = NewSchemaDiffWithFieldInfos("users",
+			RemoveTableSchemaConfig(sourceSchema), RemoveTableSchemaConfig(destSchema),
+			sourceFields, destFields)
+		diffLines := sc.getSchemaDiff(sd)
+		t.Logf("diffLines: %v", diffLines)
+		hasNameChange := false
+		for _, line := range diffLines {
+			if strings.Contains(strings.ToLower(line), "name") && strings.Contains(strings.ToLower(line), "change ") {
+				hasNameChange = true
+			}
+		}
+		if !hasNameChange {
+			t.Error("expected CHANGE for name (varchar 100→200) via structured path")
+		}
+	})
+
+	t.Run("identical fields produce no diff via structured path", func(t *testing.T) {
+		sc := &SchemaSync{Config: &Config{}}
+		cfg := &Config{}
+		sd := sc.getAlterDataBySchema("users", sourceSchema, sourceSchema, cfg)
+		sd.SchemaDiff = NewSchemaDiffWithFieldInfos("users",
+			RemoveTableSchemaConfig(sourceSchema), RemoveTableSchemaConfig(sourceSchema),
+			sourceFields, sourceFields)
+		diffLines := sc.getSchemaDiff(sd)
+		if len(diffLines) > 0 {
+			t.Errorf("identical fields should produce no diff, got: %v", diffLines)
+		}
+	})
+}
+
+// TestIsMultiStatementParseError covers the safety-critical function that
+// determines whether a multi-statement DDL failure is safe to retry
+// per-statement. C1: no prior test coverage.
+func TestIsMultiStatementParseError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil error", nil, false},
+		{"generic error", fmt.Errorf("connection refused"), false},
+		{"wrapped generic error", fmt.Errorf("wrapped: %w", fmt.Errorf("some error")), false},
+		{"multistatements substring", fmt.Errorf("multiStatements not enabled"), true},
+		{"multi-statement substring", fmt.Errorf("multi-statement queries disabled"), true},
+		{"commands out of sync", fmt.Errorf("commands out of sync"), true},
+		{"error 1064 parse error (unsafe)", &mysql.MySQLError{Number: 1064, Message: "syntax error"}, false},
+		{"error 1148 NOT_ALLOWED_COMMAND (unsafe, may have partial commits)", &mysql.MySQLError{Number: 1148, Message: "not allowed"}, false},
+		{"error 1295 ER_UNSUPPORTED_PS (safe)", &mysql.MySQLError{Number: 1295, Message: "unsupported ps"}, true},
+		{"error 1064 with other text", fmt.Errorf("Error 1064: You have an error in your SQL syntax"), false},
+		{"wrapped mysql 1295 error", fmt.Errorf("wrapped: %w", &mysql.MySQLError{Number: 1295, Message: "ps"}), true},
+		{"unrelated mysql error 1045", &mysql.MySQLError{Number: 1045, Message: "access denied"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isMultiStatementParseError(tt.err)
+			if got != tt.want {
+				t.Errorf("isMultiStatementParseError() = %v, want %v", got, tt.want)
+			}
+		})
+	}
 }

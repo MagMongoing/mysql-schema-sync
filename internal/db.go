@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql" // mysql driver
@@ -95,8 +96,8 @@ func (f *FieldInfo) String() string {
 		parts = append(parts, "NULL")
 	}
 
-	// Default value (generated columns don't have defaults)
-	if f.ColumnDefault != nil && f.GenerationExpression == "" {
+	// Default value (MySQL 8.0.13+ allows DEFAULT on generated columns)
+	if f.ColumnDefault != nil {
 		defaultValue := *f.ColumnDefault
 		upperDefault := strings.ToUpper(defaultValue)
 
@@ -120,21 +121,32 @@ func (f *FieldInfo) String() string {
 		}
 	}
 
-	// Extra (filter out DEFAULT_GENERATED and GENERATED markers handled separately)
+	// Extra: filter out generation-related tokens handled separately below.
+	// Uses token-based filtering to avoid accidentally stripping unrelated keywords.
 	if f.Extra != "" {
-		extra := f.Extra
-		extra = strings.ReplaceAll(extra, "DEFAULT_GENERATED", "")
-		extra = strings.ReplaceAll(extra, "VIRTUAL GENERATED", "")
-		extra = strings.ReplaceAll(extra, "STORED GENERATED", "")
-		extra = strings.TrimSpace(extra)
-		if extra != "" {
-			parts = append(parts, strings.ToUpper(extra))
+		strippedTokens := []string{"DEFAULT_GENERATED", "VIRTUAL", "STORED", "GENERATED"}
+		tokens := strings.Fields(f.Extra)
+		var kept []string
+		for _, tok := range tokens {
+			keep := true
+			for _, s := range strippedTokens {
+				if strings.EqualFold(tok, s) {
+					keep = false
+					break
+				}
+			}
+			if keep {
+				kept = append(kept, tok)
+			}
+		}
+		if len(kept) > 0 {
+			parts = append(parts, strings.ToUpper(strings.Join(kept, " ")))
 		}
 	}
 
 	// Virtual/Stored keyword for generated columns (after NULL/NOT NULL)
 	if f.GenerationExpression != "" {
-		if strings.Contains(f.Extra, "STORED") {
+		if strings.Contains(strings.ToUpper(f.Extra), "STORED") {
 			parts = append(parts, "STORED")
 		} else {
 			parts = append(parts, "VIRTUAL")
@@ -343,9 +355,10 @@ const (
 
 // MyDb db struct
 type MyDb struct {
-	sqlDB  *sql.DB
-	dbType dbType
-	dbName string // 数据库名称
+	sqlDB     *sql.DB
+	dbType    dbType
+	dbName    string // 数据库名称
+	closeOnce sync.Once
 }
 
 // NewMyDb creates a new MyDb connection, verifies it with Ping, and returns the database name
@@ -373,15 +386,20 @@ func NewMyDb(dsn string, dbType dbType) (*MyDb, error) {
 	}, nil
 }
 
-// getDatabaseName extracts database name from the current database connection
+// getDatabaseName extracts database name from the current database connection.
+// Returns an error if no default schema is configured (DATABASE() is NULL),
+// since the rest of the tool keys off db.dbName for INFORMATION_SCHEMA queries.
 func getDatabaseName(db *sql.DB) (string, error) {
-	var dbName string
+	var dbName sql.NullString
 	const query = "SELECT DATABASE()"
-	err := db.QueryRow(query).Scan(&dbName)
-	if err != nil {
-		log.Printf("QueryRow %q, Result=%q, Err=%v", query, dbName, err)
+	if err := db.QueryRow(query).Scan(&dbName); err != nil {
+		log.Printf("QueryRow %q, Err=%v", query, err)
+		return "", err
 	}
-	return dbName, err
+	if !dbName.Valid || dbName.String == "" {
+		return "", fmt.Errorf("DSN must specify a default database (got NULL from SELECT DATABASE())")
+	}
+	return dbName.String, nil
 }
 
 // GetTableNames returns all table names (excluding views) from the database
@@ -418,7 +436,12 @@ func (db *MyDb) GetTableNames() ([]string, error) {
 			}
 			valObj[col] = v
 		}
-		if valObj["Engine"] != nil {
+		// Filter out views and broken/recovery-state entries:
+		// - views typically return Engine = NULL
+		// - some MySQL versions return an empty string instead of NULL
+		// Only treat rows with a non-empty Engine string as base tables.
+		engineStr, _ := valObj["Engine"].(string)
+		if engineStr != "" {
 			name, ok := valObj["Name"].(string)
 			if ok {
 				tables = append(tables, name)
@@ -590,10 +613,14 @@ func (db *MyDb) Exec(query string, args ...any) (result sql.Result, err error) {
 	return db.sqlDB.Exec(query, args...)
 }
 
-// Close closes the database connection pool
+// Close closes the database connection pool. L5: uses sync.Once for
+// idempotency across concurrent close calls.
 func (db *MyDb) Close() error {
-	if db.sqlDB != nil {
-		return db.sqlDB.Close()
-	}
-	return nil
+	var closeErr error
+	db.closeOnce.Do(func() {
+		if db.sqlDB != nil {
+			closeErr = db.sqlDB.Close()
+		}
+	})
+	return closeErr
 }

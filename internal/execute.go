@@ -28,10 +28,14 @@ func Execute(cfg *Config) {
 	}
 	defer func() {
 		if sc.SourceDb != nil {
-			sc.SourceDb.Close()
+			if err := sc.SourceDb.Close(); err != nil {
+				log.Printf("[WARN] close SourceDb: %s", err)
+			}
 		}
 		if sc.DestDb != nil {
-			sc.DestDb.Close()
+			if err := sc.DestDb.Close(); err != nil {
+				log.Printf("[WARN] close DestDb: %s", err)
+			}
 		}
 	}()
 	allTables, err := sc.AllDBTables()
@@ -121,18 +125,21 @@ func Execute(cfg *Config) {
 
 			if sc.Config.Sync {
 				ret = sc.SyncSQL4Dest(sql, sqls)
-				tableCount := len(sds)
+				sqlCount := len(sqls)
 				if ret == nil {
-					countSuccess += tableCount
+					countSuccess += sqlCount
 				} else {
-					countFailed += tableCount
+					countFailed += sqlCount
 				}
 			}
 			for _, st := range sts {
 				st.alterRet = ret
-				st.schemaAfter, err = sc.DestDb.GetTableSchema(st.table)
-				if err != nil {
-					log.Printf("[WARN] get schema after sync for %q failed: %s", st.table, err)
+				if sc.Config.Sync {
+					var getErr error
+					st.schemaAfter, getErr = sc.DestDb.GetTableSchema(st.table)
+					if getErr != nil {
+						log.Printf("[WARN] get schema after sync for %q failed: %s", st.table, getErr)
+					}
 				}
 				st.timer.stop()
 			}

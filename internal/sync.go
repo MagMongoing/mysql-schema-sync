@@ -1,12 +1,15 @@
 package internal
 
 import (
+	"errors"
 	"fmt"
 	"log"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/xanygo/anygo/cli/xcolor"
 )
 
@@ -55,11 +58,11 @@ func NewSchemaSync(config *Config) (*SchemaSync, error) {
 func (sc *SchemaSync) AllDBTables() ([]string, error) {
 	sourceTables, err := sc.SourceDb.GetTableNames()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("source: %w", err)
 	}
 	destTables, err := sc.DestDb.GetTableNames()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("dest: %w", err)
 	}
 	tables := slices.Clone(destTables)
 	for _, name := range sourceTables {
@@ -67,16 +70,22 @@ func (sc *SchemaSync) AllDBTables() ([]string, error) {
 			tables = append(tables, name)
 		}
 	}
+	sort.Strings(tables)
 	return tables, nil
 }
 
 // RemoveTableSchemaConfig 删除表创建引擎信息，编码信息，分区信息，已修复同步表结构遇到分区表异常退出问题，
 // 对于分区表，只会同步字段，索引，主键，外键的变更
-// Uses ") ENGINE" to avoid truncating column comments that happen to contain "ENGINE"
+// Uses case-insensitive match on ") ENGINE" to also tolerate MariaDB / dump tools
+// that emit ")engine=" or ") engine=".
+var engineReg = regexp.MustCompile(`(?i)\)\s*ENGINE\b`)
+
 func RemoveTableSchemaConfig(schema string) string {
-	idx := strings.LastIndex(schema, ") ENGINE")
-	if idx >= 0 {
-		return schema[:idx+1] // keep the closing ")"
+	loc := engineReg.FindStringIndex(schema)
+	if loc != nil {
+		// loc[0] is the byte offset of the ')'; keep everything up to and
+		// including it, discarding the ENGINE clause and partition info.
+		return schema[:loc[0]+1]
 	}
 	// Fallback: no ") ENGINE" found, return as-is (e.g. partitioned tables or test data)
 	return schema
@@ -183,11 +192,9 @@ func (sc *SchemaSync) getSchemaDiff(alter *TableAlterData) []string {
 		for fieldName, value := range sourceMyS.Fields.Iter() {
 			if sc.Config.IsIgnoreField(table, fieldName) {
 				log.Printf("ignore column %s.%s", table, fieldName)
-				// Still update position tracking if the field exists in dest,
-				// so subsequent ADD statements position correctly
-				if _, has := destMyS.Fields.Get(fieldName); has {
-					beforeFieldName = fieldName
-				}
+				// M1 fix: always advance position tracker for ignored source fields
+				// (beforeFieldName tracks source iteration order, not dest presence).
+				beforeFieldName = fieldName
 				fieldCount++
 				continue
 			}
@@ -305,10 +312,8 @@ func (sc *SchemaSync) getSchemaDiff(alter *TableAlterData) []string {
 		for fieldName, value := range sourceMyS.Fields.Iter() {
 			if sc.Config.IsIgnoreField(table, fieldName) {
 				log.Printf("ignore column %s.%s", table, fieldName)
-				// Still update position tracking if the field exists in dest
-				if _, has := destMyS.Fields.Get(fieldName); has {
-					beforeFieldName = fieldName
-				}
+				// M1 fix: always advance position tracker for ignored source fields.
+				beforeFieldName = fieldName
 				fieldCount++
 				continue
 			}
@@ -354,7 +359,7 @@ func (sc *SchemaSync) getSchemaDiff(alter *TableAlterData) []string {
 				continue
 			}
 			if _, has := sourceMyS.Fields.Get(name); !has {
-				alterSQL := fmt.Sprintf("drop %s", quoteIdentifier(name))
+				alterSQL := fmt.Sprintf("DROP COLUMN %s", quoteIdentifier(name))
 				alterLines = append(alterLines, alterSQL)
 				debugf("check column.drop %s.%s alterSQL=%s", table, name, alterSQL)
 			} else {
@@ -472,6 +477,44 @@ func sortedMapKeys(m map[string]*DbIndex) []string {
 	return keys
 }
 
+// isMultiStatementParseError returns true ONLY when the driver/server rejected
+// the multi-statement payload up-front — meaning no statements have executed.
+// MySQL signals per-statement parse errors (ER_PARSE_ERROR = 1064) at the
+// boundary between statements, but by then earlier DDL may already have been
+// implicitly committed. We therefore treat 1064 as a NON-safe indicator and
+// only trust driver-level rejection text (e.g. "multiStatements" disabled,
+// "commands out of sync") as proof that nothing was committed.
+func isMultiStatementParseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	// Driver-level indicators that the multi-statement form was rejected
+	// before any statement was executed:
+	if strings.Contains(msg, "multistatements") || strings.Contains(msg, "multi-statement") {
+		return true
+	}
+	if strings.Contains(msg, "commands out of sync") {
+		return true
+	}
+	// CRITICAL: Do NOT match "error 1064" or "you have an error in your sql
+	// syntax" here. MySQL returns these for per-statement parse errors, where
+	// earlier statements may already have been implicitly committed (DDL
+	// implicit commit). Falling back to per-statement execution would re-run
+	// committed DDL and mask the real error.
+	//
+	// Also check for a typed *mysql.MySQLError: only ER_NOT_ALLOWED_COMMAND
+	// (1148) or similar driver-level codes are safe. 1064 is NOT safe here.
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) {
+		switch mysqlErr.Number {
+		case 1295: // ER_UNSUPPORTED_PS — prepared-statement protocol doesn't support multi
+			return true
+		}
+	}
+	return false
+}
+
 // SyncSQL4Dest sync schema change
 func (sc *SchemaSync) SyncSQL4Dest(sqlStr string, sqls []string) error {
 	sqlStr = strings.TrimSpace(sqlStr)
@@ -484,42 +527,55 @@ func (sc *SchemaSync) SyncSQL4Dest(sqlStr string, sqls []string) error {
 	t := newMyTimer()
 	ret, err := sc.DestDb.Query(sqlStr)
 	if ret != nil {
-		// Iterate all result sets to detect errors from 2nd+ statements in multi-statement queries
+		// Iterate all result sets to detect errors from 2nd+ statements in multi-statement queries.
+		// Some drivers surface errors only after iteration / Close; we collect from both NextResultSet
+		// loop and Close() to avoid losing failures from the first statement.
 		for ret.NextResultSet() {
 			// drain result sets; errors are captured below
 		}
-		if rsErr := ret.Err(); rsErr != nil && err == nil {
-			err = fmt.Errorf("multi-statement execution error: %w", rsErr)
-		}
-		ret.Close()
+		rsErr := ret.Err()
+		closeErr := ret.Close()
 		ret = nil
+		// M13: join all error causes so no root cause is silently dropped.
+		err = errors.Join(err, rsErr, closeErr)
 	}
 
-	// If multi-statement query failed (e.g. allowMultiQueries not enabled), try each statement individually.
-	// Note: DDL statements cause implicit commits in MySQL, so we do NOT wrap in a transaction —
-	// rollback would be ineffective. Each statement is executed independently and results are tracked.
-	if err != nil && len(sqls) > 1 {
+	// If the multi-statement send failed because the driver/server did not accept
+	// the multi-statement form (allowMultiQueries not enabled, or first-statement
+	// parse error), we can safely fall back to per-statement Exec — at that point
+	// nothing has been committed.
+	//
+	// CRITICAL: We must NOT fall back if the multi-statement send was *partially*
+	// applied. DDL causes implicit COMMIT in MySQL, so re-running statements that
+	// already succeeded would fail with "duplicate"/"already exists" and report
+	// the wrong root cause. We therefore only fall back when the error pattern
+	// matches "multi-statement not enabled" / "syntax error at the start".
+	if err != nil && len(sqls) > 1 && isMultiStatementParseError(err) {
 		originalErr := err
-		log.Println("Exec_mut_query failed, err=", errString(originalErr), ", now try exec SQLs foreach")
-		var firstErr error
+		log.Println("Exec_mut_query parse-failed, err=", errString(originalErr), ", now try exec SQLs foreach")
+		var failErrs []error
 		var successCount int
 		for i, sql := range sqls {
 			_, err = sc.DestDb.Exec(sql)
 			log.Println("exec_one:[", sql, "]", errString(err))
 			if err != nil {
-				if firstErr == nil {
-					firstErr = fmt.Errorf("statement %d failed: %w", i+1, err)
-				}
-				break
+				failErrs = append(failErrs, fmt.Errorf("statement %d failed: %w", i+1, err))
+				continue
 			}
 			successCount++
 		}
-		if firstErr != nil {
-			log.Printf("[WARN] %d of %d DDL statements succeeded before failure (DDL implicit commit — partial changes may exist)", successCount, len(sqls))
-			err = fmt.Errorf("fallback exec failed after original error (%w): %w", originalErr, firstErr)
+		if len(failErrs) > 0 {
+			log.Printf("[WARN] %d of %d DDL statements succeeded, %d failed (DDL implicit commit — partial changes may exist)", successCount, len(sqls), len(failErrs))
+			err = fmt.Errorf("fallback exec: %d/%d succeeded: %w", successCount, len(sqls), errors.Join(failErrs...))
 		} else {
 			err = nil
 		}
+	} else if err != nil && len(sqls) > 1 {
+		// Multi-statement was accepted but a later statement failed: earlier DDL
+		// has already been implicitly committed. Do NOT retry — surface the
+		// original error so the operator can manually reconcile.
+		log.Printf("[WARN] multi-statement DDL partially applied (DDL implicit commit) — NOT retrying. Original error: %s", errString(err))
+		err = fmt.Errorf("multi-statement DDL partially applied (DDL implicit commit, not retried): %w", err)
 	}
 	t.stop()
 	if err != nil {

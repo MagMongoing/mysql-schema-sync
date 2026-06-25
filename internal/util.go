@@ -3,6 +3,7 @@ package internal
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"html"
 	"log"
 	"os"
@@ -21,23 +22,31 @@ const AppURL = "https://github.com/hidu/mysql-schema-sync/"
 
 const timeFormatStd string = "2006-01-02 15:04:05"
 
+const maxConfigSize = 10 * 1024 * 1024 // 10 MB — reject pathological configs
+
 // loadJSONFile loads a JSON config file, stripping lines that start with # or //.
-// Note: Comment stripping is line-based, so a multi-line string value whose continuation
-// line starts with # or // would be incorrectly removed. Standard JSON config files are
-// not affected since string values do not span multiple lines.
+// M5: comment lines are replaced (not removed) to preserve newline positions,
+// so JSON parse error offsets match the original file. A size guard prevents
+// OOM on adversarial configs.
 func loadJSONFile(jsonPath string, val any) error {
 	bs, err := os.ReadFile(jsonPath)
 	if err != nil {
 		return err
 	}
+	if len(bs) > maxConfigSize {
+		return fmt.Errorf("config file %q exceeds maximum size (%d bytes > %d)", jsonPath, len(bs), maxConfigSize)
+	}
 	lines := strings.Split(string(bs), "\n")
 	var bf bytes.Buffer
 	for _, line := range lines {
-		lineNew := strings.TrimSpace(line)
-		if (len(lineNew) > 0 && lineNew[0] == '#') || (len(lineNew) > 1 && lineNew[0:2] == "//") {
+		trimmed := strings.TrimSpace(line)
+		if (len(trimmed) > 0 && trimmed[0] == '#') || (len(trimmed) > 1 && trimmed[0:2] == "//") {
+			// Preserve line position: emit empty line instead of removing.
+			bf.WriteByte('\n')
 			continue
 		}
-		bf.WriteString(lineNew)
+		bf.WriteString(line)
+		bf.WriteByte('\n')
 	}
 	return json.Unmarshal(bf.Bytes(), &val)
 }
@@ -62,15 +71,27 @@ func simpleMatch(patternStr string, str string, msg ...string) bool {
 
 	var re *regexp.Regexp
 	if cached, ok := simpleMatchCache.Load(pattern); ok {
-		re = cached.(*regexp.Regexp)
-	} else {
+		// Use the comma-ok form on the type assertion so a future code path that
+		// inadvertently stores a different value type does not panic at runtime.
+		if cachedRe, typeOK := cached.(*regexp.Regexp); typeOK {
+			re = cachedRe
+		}
+	}
+	if re == nil {
 		var err error
 		re, err = regexp.Compile(pattern)
 		if err != nil {
 			log.Println("simple_match:error", msg, "patternStr:", patternStr, "pattern:", pattern, "str:", str, "err:", err)
 			return false
 		}
-		simpleMatchCache.Store(pattern, re)
+		// LoadOrStore so concurrent compiles end up sharing one cached entry
+		// (avoids double-store racing on hot patterns; the rejected compile is
+		// simply discarded by the GC).
+		if actual, loaded := simpleMatchCache.LoadOrStore(pattern, re); loaded {
+			if cachedRe, typeOK := actual.(*regexp.Regexp); typeOK {
+				re = cachedRe
+			}
+		}
 	}
 	return re.MatchString(str)
 }
@@ -97,7 +118,13 @@ func dsnShort(dsn string) string {
 		// to avoid leaking credentials in logs or emails.
 		return "<invalid DSN>"
 	}
-	return dsn[i+1:]
+	suffix := dsn[i+1:]
+	// M7: strip DSN query-string parameters (?tls=...&serverPubKey=...)
+	// to avoid leaking sensitive values like TLS keys or auth tokens.
+	if qIdx := strings.Index(suffix, "?"); qIdx >= 0 {
+		suffix = suffix[:qIdx]
+	}
+	return suffix
 }
 
 func errString(err error) string {
