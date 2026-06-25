@@ -556,8 +556,8 @@ func writeHTMLResult(str string) {
 // of relying on init() to keep flag surface scoped to the binary that imports
 // this package.
 func RegisterFlags() {
-	flag.StringVar(&htmlResultPath, "html", "", "html result file path")
-	flag.BoolVar(&httpAllowPublic, "http-allow-public", false, "allow HTTP report server to bind to non-loopback addresses")
+	flag.StringVar(&htmlResultPath, "html", "", "write HTML diff report to this file path (default: $TMPDIR/mysql-schema-sync_last.html)")
+	flag.BoolVar(&httpAllowPublic, "http-allow-public", false, "allow -http to bind non-loopback addresses (WARNING: no authentication, schema details exposed)")
 }
 
 var htmlResultPath string

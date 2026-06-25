@@ -11,29 +11,35 @@ import (
 	"github.com/hidu/mysql-schema-sync/internal"
 )
 
-var configPath = flag.String("conf", "./mydb_conf.json", "json config file path")
-var doSync = flag.Bool("sync", false, "sync schema changes to dest's db\non default, only show difference")
-var drop = flag.Bool("drop", false, "drop fields,index,foreign key only on dest's table")
-var fieldOrder = flag.Bool("field-order", false, "sync field order (may require table rebuild, affecting performance)")
-var httpAddress = flag.String("http", "", "HTTP service address, eg. :8080")
+var configPath = flag.String("conf", "./mydb_conf.json", "path to JSON config file (supports # and // comments)")
+var doSync = flag.Bool("sync", false, "execute schema changes on destination database (default: dry-run, only show diff)")
+var drop = flag.Bool("drop", false, "drop columns, indexes, and foreign keys that exist only in destination")
+var fieldOrder = flag.Bool("field-order", false, "sync column order via MODIFY COLUMN (may require table rebuild)")
+var httpAddress = flag.String("http", "", "HTTP report server listen address, e.g. :8080 (loopback-only unless -http-allow-public)")
 
-var source = flag.String("source", "", "sync from, eg: test@(10.10.0.1:3306)/my_online_db_name\nwhen it is not empty,[-conf] while ignore")
-var dest = flag.String("dest", "", "sync to, eg: test@(127.0.0.1:3306)/my_local_db_name")
-var tables = flag.String("tables", "", "tables to sync\neg : product_base,order_*")
-var tablesIgnore = flag.String("tables_ignore", "", "tables ignore sync\neg : product_base,order_*")
-var mailTo = flag.String("mail_to", "", "overwrite config's email.to")
-var singleSchemaChange = flag.Bool("single_schema_change", false, "single schema changes ddl command a single schema change")
-var debug = flag.Bool("debug", false, "enable verbose debug logging")
+var source = flag.String("source", "", "source DSN, e.g. user:pass@tcp(10.10.0.1:3306)/dbname (overrides -conf)")
+var dest = flag.String("dest", "", "destination DSN, e.g. user:pass@tcp(127.0.0.1:3306)/dbname (required with -source)")
+var tables = flag.String("tables", "", "comma-separated table whitelist with wildcard support, e.g. product_base,order_*")
+var tablesIgnore = flag.String("tables_ignore", "", "comma-separated table ignore list with wildcard support, e.g. *_log,cache_*")
+var mailTo = flag.String("mail_to", "", "override config email recipients (semicolon-separated)")
+var singleSchemaChange = flag.Bool("single_schema_change", false, "emit one ALTER clause per statement instead of combining into a single ALTER TABLE")
+var skipTimestampToDatetime = flag.Bool("skip_timestamp_to_datetime", false, "skip timestamp→datetime type conversion (preserve destination's datetime columns)")
+var debug = flag.Bool("debug", false, "enable verbose debug logging (SQL text, timing, structured comparison details)")
 
 func init() {
 	log.SetFlags(log.Lshortfile | log.Ldate)
 	internal.RegisterFlags()
 	df := flag.Usage
 	flag.Usage = func() {
-		df()
+		fmt.Fprintf(os.Stderr, "mysql-schema-sync %s — MySQL schema diff & sync tool\n", internal.Version)
+		fmt.Fprintf(os.Stderr, "%s\n\n", internal.AppURL)
+		fmt.Fprintln(os.Stderr, "Usage:")
+		fmt.Fprintln(os.Stderr, "  mysql-schema-sync -conf config.json              # dry-run: show diff only")
+		fmt.Fprintln(os.Stderr, "  mysql-schema-sync -conf config.json -sync        # execute changes")
+		fmt.Fprintln(os.Stderr, "  mysql-schema-sync -source DSN -dest DSN -sync    # DSN mode (no config file)")
 		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "mysql schema sync tools "+internal.Version)
-		fmt.Fprint(os.Stderr, internal.AppURL+"\n\n")
+		fmt.Fprintln(os.Stderr, "Flags:")
+		df()
 	}
 }
 
@@ -117,6 +123,9 @@ func applyCLIOverrides(cfg *internal.Config, visitedFlags map[string]bool) {
 	}
 	if visitedFlags["single_schema_change"] {
 		cfg.SingleSchemaChange = *singleSchemaChange
+	}
+	if visitedFlags["skip_timestamp_to_datetime"] {
+		cfg.SkipTimestampToDatetime = *skipTimestampToDatetime
 	}
 
 	if visitedFlags["mail_to"] {
